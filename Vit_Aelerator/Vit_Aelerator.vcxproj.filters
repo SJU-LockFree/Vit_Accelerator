@@ -15,25 +15,34 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="info.c">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-    <ClCompile Include="gemm.c">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-    <ClCompile Include="KernelCode.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-    <ClCompile Include="main.cpp">
-      <Filter>소스 파일</Filter>
-    </ClCompile>
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="kernel.cl" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="gemm.h">
+    <ClInclude Include="..\..\Transformer_Project\comparator.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\Transformer_Project\dirent.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Transformer_Project\Network.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\Transformer_Project\ViT_seq.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\Transformer_Project\comparator.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Transformer_Project\dirent.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Transformer_Project\Main.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Transformer_Project\Network.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="..\..\Transformer_Project\ViT_seq.c">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

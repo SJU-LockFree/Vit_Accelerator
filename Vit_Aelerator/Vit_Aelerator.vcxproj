@@ -18,6 +18,19 @@
       <Platform>x64</Platform>
     </ProjectConfiguration>
   </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\..\Transformer_Project\comparator.h" />
+    <ClInclude Include="..\..\Transformer_Project\dirent.h" />
+    <ClInclude Include="..\..\Transformer_Project\Network.h" />
+    <ClInclude Include="..\..\Transformer_Project\ViT_seq.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="..\..\Transformer_Project\comparator.c" />
+    <ClCompile Include="..\..\Transformer_Project\dirent.c" />
+    <ClCompile Include="..\..\Transformer_Project\Main.c" />
+    <ClCompile Include="..\..\Transformer_Project\Network.c" />
+    <ClCompile Include="..\..\Transformer_Project\ViT_seq.c" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
@@ -125,18 +138,6 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup>
-    <ClCompile Include="gemm.c" />
-    <ClCompile Include="info.c" />
-    <ClCompile Include="KernelCode.cpp" />
-    <ClCompile Include="main.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="kernel.cl" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="gemm.h" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
