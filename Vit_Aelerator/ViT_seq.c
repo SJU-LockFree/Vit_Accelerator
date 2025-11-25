@@ -125,16 +125,19 @@ void multihead_attn(float* input, float* output,
     Network in_weight, Network in_bias, Network out_weight, Network out_bias) {
 
     int head_dim = embed_dim / num_heads, tokens = ((img_size / patch_size) * (img_size / patch_size)) + 1;
-   
+
     /*Allocate Q, K, V : tokens * dim*/
     int Q_dim = 0, K_dim = embed_dim, V_dim = embed_dim * 2;
     float* Q = (float*)malloc(sizeof(float) * tokens * embed_dim);
     float* K = (float*)malloc(sizeof(float) * tokens * embed_dim);
     float* V = (float*)malloc(sizeof(float) * tokens * embed_dim);
+    //printf("toekn : %d\n", tokens);
 
-    /*Q, K, V 구하기*/
+    //Q, K, V 구하기 ** (!! 중요 !!)왜인지는 모르겠지만 이 줄의 주석을 //에서 /**/로 바꾸면 아래의 for()이 실행 안된다!!!**
     for (int t = 0; t < tokens; t++) {
+        //printf("t : %d\n", t);
         float sum_q, sum_k, sum_v;
+        //printf("CHECK0");
         for (int i = 0; i < embed_dim; i++) {
             sum_q = in_bias.data[Q_dim + i], sum_k = in_bias.data[K_dim + i], sum_v = in_bias.data[V_dim + i];
             for (int j = 0; j < embed_dim; j++) {
@@ -145,14 +148,16 @@ void multihead_attn(float* input, float* output,
             Q[t * embed_dim + i] = sum_q;
             K[t * embed_dim + i] = sum_k;
             V[t * embed_dim + i] = sum_v;
+            //printf("V : %lf\n", V[t * embed_dim + i]);
         }
     }
     int print_tokens = tokens < 5 ? tokens : 5;
     int print_dims = embed_dim < 10 ? embed_dim : 10;
-
+    //printf("CHECK1");
+    
     /*Attn 결과를 저장할 버퍼*/
     float* attn_output = (float*)malloc(sizeof(float) * tokens * embed_dim);
-    for (int i = 0; i < tokens * embed_dim; i++) attn_output[i] = 0.0f;
+    for (int i = 0; i < tokens * embed_dim; i++) { attn_output[i] = 0.0f; }
 
     /*head별로 attn 수행*/
     for (int h = 0; h < num_heads; h++) {
@@ -348,12 +353,15 @@ void ViT_seq(ImageData* image, Network* networks, float** probabilities) {
     //printf("%d %d = %d\n", token_size, hidden_dim, token_size * hidden_dim);
 
     for (int i = 0; i < 4; i++) {
-        layer[i] = (float*)malloc(sizeof(float) * size[i]);
+        layer[i] = (float*)calloc(sizeof(float) , size[i]);
+        //layer[i] = (float*)malloc(sizeof(float) * size[i]);
     }
     for (int i = 0; i < 12; i++) {
-        enc_layer[i] = (float*)malloc(sizeof(float) * enc_size);
+        enc_layer[i] = (float*)calloc(sizeof(float) , enc_size);
+        //enc_layer[i] = (float*)malloc(sizeof(float) * enc_size);
     }
-    enc_output = (float*)malloc(sizeof(float) * enc_size);
+    enc_output = (float*)calloc(sizeof(float) , enc_size);
+    //enc_output = (float*)malloc(sizeof(float) * enc_size);
 
     for (int i = 0; i < image->n; i++) {
         /*patch embedding*/
@@ -365,68 +373,95 @@ void ViT_seq(ImageData* image, Network* networks, float** probabilities) {
         /*position embedding*/
         pos_emb(layer[2], layer[3], networks[3]);
 
+
         /*Encoder - 12 Layers*/
         Encoder(layer[3], enc_layer[0],
-            networks[4], networks[5], networks[6], networks[7],
-            networks[8], networks[9], networks[10], networks[11],
-            networks[12], networks[13], networks[14], networks[15]);
+                networks[4], networks[5], networks[6], networks[7],
+                networks[8], networks[9], networks[10], networks[11],
+                networks[12], networks[13], networks[14], networks[15]);
+        printf("Passed 1st Encoder...\n");
+        
 
         Encoder(enc_layer[0], enc_layer[1],
-            networks[16], networks[17], networks[18], networks[19],
-            networks[20], networks[21], networks[22], networks[23],
-            networks[24], networks[25], networks[26], networks[27]);
+                networks[16], networks[17], networks[18], networks[19],
+                networks[20], networks[21], networks[22], networks[23],
+                networks[24], networks[25], networks[26], networks[27]);
+        printf("Passed 2nd Encoder...\n");
+
 
         Encoder(enc_layer[1], enc_layer[2],
-            networks[28], networks[29], networks[30], networks[31],
-            networks[32], networks[33], networks[34], networks[35],
-            networks[36], networks[37], networks[38], networks[39]);
+                networks[28], networks[29], networks[30], networks[31],
+                networks[32], networks[33], networks[34], networks[35],
+                networks[36], networks[37], networks[38], networks[39]);
+        printf("Passed 3rd Encoder...\n");
+
 
         Encoder(enc_layer[2], enc_layer[3],
-            networks[40], networks[41], networks[42], networks[43],
-            networks[44], networks[45], networks[46], networks[47],
-            networks[48], networks[49], networks[50], networks[51]);
+                networks[40], networks[41], networks[42], networks[43],
+                networks[44], networks[45], networks[46], networks[47],
+                networks[48], networks[49], networks[50], networks[51]);
+        printf("Passed 4th Encoder...\n");
+
 
         Encoder(enc_layer[3], enc_layer[4],
-            networks[52], networks[53], networks[54], networks[55],
-            networks[56], networks[57], networks[58], networks[59],
-            networks[60], networks[61], networks[62], networks[63]);
+                networks[52], networks[53], networks[54], networks[55],
+                networks[56], networks[57], networks[58], networks[59],
+                networks[60], networks[61], networks[62], networks[63]);
+        printf("Passed 5th Encoder...\n");
+
 
         Encoder(enc_layer[4], enc_layer[5],
-            networks[64], networks[65], networks[66], networks[67],
-            networks[68], networks[69], networks[70], networks[71],
-            networks[72], networks[73], networks[74], networks[75]);
+                networks[64], networks[65], networks[66], networks[67],
+                networks[68], networks[69], networks[70], networks[71],
+                networks[72], networks[73], networks[74], networks[75]);
+        printf("Passed 6th Encoder...\n");
+
 
         Encoder(enc_layer[5], enc_layer[6],
-            networks[76], networks[77], networks[78], networks[79],
-            networks[80], networks[81], networks[82], networks[83],
-            networks[84], networks[85], networks[86], networks[87]);
+                networks[76], networks[77], networks[78], networks[79],
+                networks[80], networks[81], networks[82], networks[83],
+                networks[84], networks[85], networks[86], networks[87]);
+        printf("Passed 7th Encoder...\n");
+
 
         Encoder(enc_layer[6], enc_layer[7],
-            networks[88], networks[89], networks[90], networks[91],
-            networks[92], networks[93], networks[94], networks[95],
-            networks[96], networks[97], networks[98], networks[99]);
+                networks[88], networks[89], networks[90], networks[91],
+                networks[92], networks[93], networks[94], networks[95],
+                networks[96], networks[97], networks[98], networks[99]);
+        printf("Passed 8th Encoder...\n");
+
 
         Encoder(enc_layer[7], enc_layer[8],
-            networks[100], networks[101], networks[102], networks[103],
-            networks[104], networks[105], networks[106], networks[107],
-            networks[108], networks[109], networks[110], networks[111]);
+                networks[100], networks[101], networks[102], networks[103],
+                networks[104], networks[105], networks[106], networks[107],
+                networks[108], networks[109], networks[110], networks[111]);
+        printf("Passed 9th Encoder...\n");
+
 
         Encoder(enc_layer[8], enc_layer[9],
-            networks[112], networks[113], networks[114], networks[115],
-            networks[116], networks[117], networks[118], networks[119],
-            networks[120], networks[121], networks[122], networks[123]);
+                networks[112], networks[113], networks[114], networks[115],
+                networks[116], networks[117], networks[118], networks[119],
+                networks[120], networks[121], networks[122], networks[123]);
+        printf("Passed 10th Encoder...\n");
+
 
         Encoder(enc_layer[9], enc_layer[10],
-            networks[124], networks[125], networks[126], networks[127],
-            networks[128], networks[129], networks[130], networks[131],
-            networks[132], networks[133], networks[134], networks[135]);
+                networks[124], networks[125], networks[126], networks[127],
+                networks[128], networks[129], networks[130], networks[131],
+                networks[132], networks[133], networks[134], networks[135]);
+
+        printf("Passed 11th Encoder...\n");
+
 
         Encoder(enc_layer[10], enc_layer[11],
-            networks[136], networks[137], networks[138], networks[139],
-            networks[140], networks[141], networks[142], networks[143],
-            networks[144], networks[145], networks[146], networks[147]);
+                networks[136], networks[137], networks[138], networks[139],
+                networks[140], networks[141], networks[142], networks[143],
+                networks[144], networks[145], networks[146], networks[147]);
+
+        printf("Passed 12th Encoder...\n");
 
         layer_norm(enc_layer[11], enc_output, networks[148], networks[149]);
+        printf("Final CLS Token[0]: %f\n", enc_layer[11][0]);
 
         /* Token 값 추출 */
         float* cls_token = (float*)malloc(sizeof(float) * embed_dim);
@@ -436,5 +471,19 @@ void ViT_seq(ImageData* image, Network* networks, float** probabilities) {
         linear_layer(cls_token, cls_output, 1, embed_dim, num_classes, networks[150], networks[151]);
         /* 확률분포 추출 */
         Softmax(cls_output, probabilities[i], num_classes);
+
+        
+        float max_prob = 0;
+        int ans_idx = 0;
+        for (int j = 0; j < num_classes; j++) {
+            // printf("%d : %.6lf\n", j, probabilities[i][j]);
+            if (max_prob < probabilities[i][j]) {
+                max_prob = probabilities[i][j];
+                ans_idx = j;
+            }
+        }
+        printf("Ans : %d | Prob : %.6lf\n", ans_idx, max_prob);
+
+        printf("Process %d/%d finished!\n =============================================== \n", i, image->n);
     }
 }

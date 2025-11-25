@@ -41,7 +41,7 @@
     <ClCompile Include="..\..\Transformer_Project\Network.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
-    <ClCompile Include="..\..\Transformer_Project\ViT_seq.c">
+    <ClCompile Include="ViT_seq.c">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>

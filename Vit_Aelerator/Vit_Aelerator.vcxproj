@@ -29,7 +29,7 @@
     <ClCompile Include="..\..\Transformer_Project\dirent.c" />
     <ClCompile Include="..\..\Transformer_Project\Main.c" />
     <ClCompile Include="..\..\Transformer_Project\Network.c" />
-    <ClCompile Include="..\..\Transformer_Project\ViT_seq.c" />
+    <ClCompile Include="ViT_seq.c" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
