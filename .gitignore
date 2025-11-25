@@ -1,0 +1,12 @@
+# 실행 파일 및 빌드 부산물 무시
+*.exe
+*.obj
+*.o
+*.log
+x64/
+Debug/
+Release/
+.vs/
+
+# 결과 텍스트 파일 무시 (생성되는 파일이므로)
+Data/opencl_result.txt
