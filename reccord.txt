@@ -1,2 +1,3 @@
-seq_ver : 
-Elapsed time: 3230.97 sec
+seq_ver : 3230.97 sec
+1차 병렬화 : 106.27
+MLP 헤드 병렬화 : 106.19
