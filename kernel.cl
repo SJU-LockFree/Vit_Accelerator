@@ -251,3 +251,59 @@ __kernel void attn_value_kernel(__global const float* scores,
     // Embed_Dim = Heads * Head_Dim
     attn_output[i * EMBED_DIM + h * HEAD_DIM + d] = sum;
 }
+
+// 10. Final Classifier Softmax
+// Global Size: (NUM_CLASSES) 가 아니라 (WorkGroupSize)로 잡아서 한 번에 처리
+// Local Size: 256 or 512 (NUM_CLASSES가 1000이므로 루프를 약간 돕니다)
+__kernel void final_softmax_kernel(__global float* logits,
+    int num_classes)
+{
+    // 로컬 메모리: 워크 그룹 내 스레드들이 공유하는 고속 메모리
+    // 1024 float = 4KB (충분함)
+    __local float s_data[1024];
+
+    int tid = get_local_id(0);
+    int group_size = get_local_size(0);
+
+    // 1. Load Data to Local Memory (Global -> Local)
+    // 1000개 데이터를 스레드들이 나눠서 로딩
+    float val = (tid < num_classes) ? logits[tid] : -INFINITY;
+    s_data[tid] = val;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 2. Find Max (Parallel Reduction)
+    // 수치 안정성을 위해 최대값을 찾아서 뺍니다.
+    for (int stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_data[tid + stride] > s_data[tid]) {
+                s_data[tid] = s_data[tid + stride];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float max_val = s_data[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 3. Exponentiate
+    // 다시 본래 값을 로드하고 exp 연산 수행
+    val = (tid < num_classes) ? logits[tid] : -INFINITY;
+    val = exp(val - max_val);
+    s_data[tid] = (tid < num_classes) ? val : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4. Sum (Parallel Reduction)
+    // exp한 값들의 합을 구함
+    for (int stride = group_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_data[tid] += s_data[tid + stride];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float sum = s_data[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 5. Normalize & Write Back (Local -> Global)
+    if (tid < num_classes) {
+        logits[tid] = val / sum; // In-place update
+    }
+}

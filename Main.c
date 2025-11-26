@@ -2,12 +2,13 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
+
 #include "Network.h"
 //#include "ViT_seq.h"
 #include "ViT_opencl.h"
 #include "comparator.h"
-#include <time.h>
-#include <math.h>
 
 #define _CRT_SECURE_NO_WARNINGS
 #define MAX_SOURCE_SIZE (0x100000)

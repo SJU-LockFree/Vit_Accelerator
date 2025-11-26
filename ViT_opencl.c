@@ -38,6 +38,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_attn_score = clCreateKernel(program, "attn_score_kernel", &err);
     cl_kernel k_softmax = clCreateKernel(program, "softmax_kernel", &err);
     cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);
+    cl_kernel k_final_softmax = clCreateKernel(program, "final_softmax_kernel", &err);  // 최종 결과 선택용 커널
 
     // 2. 버퍼 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -69,6 +70,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
     // 3. Inference Loop
     for (int img_idx = 0; img_idx < image->n; img_idx++) {
+        printf("Image : %d ====================\n", img_idx);
 
         // (A) 이미지 복사 Host -> GPU
         clEnqueueWriteBuffer(queue, d_input_img, CL_TRUE, 0, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE,
@@ -186,6 +188,25 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         size_t gws_head[2] = { 1, NUM_CLASSES };
         clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_head, NULL, 0, NULL, NULL);
 
+        // [변경] (G) GPU Softmax 수행
+        clSetKernelArg(k_final_softmax, 0, sizeof(cl_mem), &d_cls_out);
+        int num_classes = NUM_CLASSES;
+        clSetKernelArg(k_final_softmax, 1, sizeof(int), &num_classes);
+
+        // 작업 크기 설정
+        // 1024개의 스레드(Work Item)를 1개의 그룹으로 묶어서 실행
+        // (NUM_CLASSES가 1000이므로 1024면 충분합니다. 2의 제곱수 권장)
+        size_t local_work_size[1] = { 1024 };
+        size_t global_work_size[1] = { 1024 };
+
+        clEnqueueNDRangeKernel(queue, k_final_softmax, 1, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+
+        // (H) Read Result 
+        // GPU가 이미 Softmax를 끝냈으므로, CPU는 읽기만 하면 됩니다.
+        clEnqueueReadBuffer(queue, d_cls_out, CL_TRUE, 0, sizeof(float) * NUM_CLASSES,
+            probabilities[img_idx], 0, NULL, NULL);
+
+        /*
         // (G) Read Result
         clEnqueueReadBuffer(queue, d_cls_out, CL_TRUE, 0, sizeof(float) * NUM_CLASSES,
             probabilities[img_idx], 0, NULL, NULL);
@@ -199,6 +220,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             sum_exp += probabilities[img_idx][k];
         }
         for (int k = 0; k < NUM_CLASSES; k++) probabilities[img_idx][k] /= sum_exp;
+        */
     }
 
     // 4. Clean up
@@ -217,6 +239,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     clReleaseKernel(k_add);
     clReleaseKernel(k_gelu);
     clReleaseKernel(k_attn_score);
-    clReleaseKernel(k_softmax);
+    clReleaseKernel(k_softmax); 
     clReleaseKernel(k_attn_val);
+    clReleaseKernel(k_final_softmax);
 }
