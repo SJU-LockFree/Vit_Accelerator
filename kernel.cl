@@ -307,3 +307,36 @@ __kernel void final_softmax_kernel(__global float* logits,
         logits[tid] = val / sum; // In-place update
     }
 }
+
+// [NEW] Fused Kernel: Linear + Bias + GELU
+// Global Size: (tokens, out_features)
+__kernel void linear_bias_gelu_kernel(__global const float* input,
+    __global float* output,
+    __global const float* weight,
+    __global const float* bias,
+    int in_features,
+    int out_features)
+{
+    int t = get_global_id(0); // Token Index
+    int o = get_global_id(1); // Output Feature Index
+
+    if (o >= out_features) return;
+
+    // 1. Bias Add (Initialize sum with bias)
+    float sum = bias[o];
+    int w_offset = o * in_features;
+    int in_offset = t * in_features;
+
+    // 2. Linear (Matrix Multiplication)
+    for (int i = 0; i < in_features; i++) {
+        sum += input[in_offset + i] * weight[w_offset + i];
+    }
+
+    // 3. GELU Activation (Fused!)
+    // Formula: 0.5 * x * (1 + erf(x / sqrt(2)))
+    // 1 / sqrt(2) approx 0.70710678f
+    float gelu_val = 0.5f * sum * (1.0f + erf(sum * 0.70710678f));
+
+    // 4. Store Result
+    output[t * out_features + o] = gelu_val;
+}

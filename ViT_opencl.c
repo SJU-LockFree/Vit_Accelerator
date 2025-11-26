@@ -39,6 +39,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_softmax = clCreateKernel(program, "softmax_kernel", &err);
     cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);
     cl_kernel k_final_softmax = clCreateKernel(program, "final_softmax_kernel", &err);  // 최종 결과 선택용 커널
+    //cl_kernel k_linear_gelu = clCreateKernel(program, "linear_bias_gelu_kernel", &err);
 
     // 2. 버퍼 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -150,6 +151,30 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
             // --- MLP ---
+            /*
+            // [수정된 코드] Fused FC1 + GELU
+            // d_buf2(Input) -> [Linear + Bias + GELU] -> d_intermediate(Output)
+            // 인자 순서는 linear_kernel과 같으므로 set_linear_args 재사용 가능!
+            set_linear_args(k_linear_gelu, d_buf2, d_intermediate,
+                d_networks[net_idx + 8], d_networks[net_idx + 9],
+                dim, hidden_dim);
+
+            size_t gws_mlp_fused[2] = { tokens, hidden_dim };
+
+            // 퓨전 커널 실행 (Linear와 GELU가 한 방에!)
+            clEnqueueNDRangeKernel(queue, k_linear_gelu, 2, NULL, gws_mlp_fused, NULL, 0, NULL, NULL);
+
+
+            // 3. FC2 (Linear) - 여긴 GELU 없음. 그냥 Linear 유지
+            // d_intermediate -> d_residual
+            set_linear_args(k_linear, d_intermediate, d_residual,
+                d_networks[net_idx + 10], d_networks[net_idx + 11],
+                hidden_dim, dim);
+            size_t gws_mlp2[2] = { tokens, dim };
+            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_mlp2, NULL, 0, NULL, NULL);
+    
+            */ 
+
             // 1. FC1: d_buf2 -> d_intermediate
             // ★중요★: 여기서 d_intermediate는 Hidden Dim (4배) 크기의 데이터를 받습니다.
             // 이전 코드에서는 여기가 size_qkv(3배)여서 터졌던 것입니다.
@@ -166,7 +191,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             set_linear_args(k_linear, d_intermediate, d_residual, d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim);
             size_t gws_mlp2[2] = { tokens, dim };
             clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_mlp2, NULL, 0, NULL, NULL);
-
+            
             // --- Residual Add 2 ---
             clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual);
             clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1);
@@ -241,5 +266,6 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     clReleaseKernel(k_attn_score);
     clReleaseKernel(k_softmax); 
     clReleaseKernel(k_attn_val);
-    clReleaseKernel(k_final_softmax);
+    clReleaseKernel(k_final_softmax); 
+    //clReleaseKernel(k_linear_gelu);
 }
