@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <CL/cl.h>
 #include "Network.h"
 #include "ViT_opencl.h"
@@ -12,6 +13,10 @@
 #define NUM_HEADS 12
 #define HEAD_DIM 64
 #define NUM_CLASSES 1000
+
+static double now_ms(void) {
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
 
 // Helper to set standard linear args
 void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b, int in_f, int out_f, int num_tokens) {
@@ -38,7 +43,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_gelu = clCreateKernel(program, "gelu_kernel", &err);
     cl_kernel k_attn_score = clCreateKernel(program, "attn_score_kernel", &err);
     cl_kernel k_softmax = clCreateKernel(program, "softmax_kernel", &err);
-    cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);
+    cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);    
 
     // 2. 버퍼 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -74,11 +79,25 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     // 3. Inference Loop
     for (int img_idx = 0; img_idx < image->n; img_idx++) {
 
+        // 타이머 변수
+        double t_upload = 0.0;
+        double t_patch_embed = 0.0;
+        double t_encoder = 0.0;
+        double t_final_ln = 0.0;
+        double t_head = 0.0;
+        double t_read = 0.0;
+        double t_softmax = 0.0;
+        double t0, t1;
+
         // (A) 이미지 복사 Host -> GPU
+        t0 = now_ms();
         clEnqueueWriteBuffer(queue, d_input_img, CL_TRUE, 0, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE,
             &image[img_idx].data[0], 0, NULL, NULL);
+        t1 = now_ms();
+        t_upload += (t1 - t0);
 
         // (B) Patch Embedding
+        t0 = now_ms();
         clSetKernelArg(k_conv2d, 0, sizeof(cl_mem), &d_input_img);
         clSetKernelArg(k_conv2d, 1, sizeof(cl_mem), &d_buf2);
         clSetKernelArg(k_conv2d, 2, sizeof(cl_mem), &d_networks[1]);
@@ -94,7 +113,13 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         size_t gws_prep[1] = { tokens * dim };
         clEnqueueNDRangeKernel(queue, k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
 
+        clFinish(queue);
+        t1 = now_ms();
+        t_patch_embed += (t1 - t0);
+
         // (D) Encoder Layers
+        t0 = now_ms();
+
         int net_idx = 4;
         for (int i = 0; i < 12; i++) {
             // --- LN1 ---
@@ -173,8 +198,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             // 2. GELU
             clSetKernelArg(k_gelu, 0, sizeof(cl_mem), &d_intermediate);
             size_t gws_gelu[1] = { tokens * hidden_dim };
-            clEnqueueNDRangeKernel(queue, k_gelu, 1, NULL, gws_gelu, NULL, 0, NULL, NULL);
-
+            clEnqueueNDRangeKernel(queue, k_gelu, 1, NULL, gws_gelu, NULL, 0, NULL, NULL);        
+            
             // 3. FC2: d_intermediate -> d_residual
             set_linear_args(k_linear, d_intermediate, d_residual, d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim, tokens);
 
@@ -191,7 +216,13 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             net_idx += 12;
         }
 
+        clFinish(queue);
+        t1 = now_ms();
+        t_encoder += (t1 - t0);
+
         // (E) Final Layer Norm
+        t0 = now_ms();
+
         clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);
         clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2);
         clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[148]);
@@ -199,7 +230,12 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         size_t gws_ln[1] = { tokens };
         clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
+        clFinish(queue);
+        t1 = now_ms();
+        t_encoder += (t1 - t0);
+
         // (F) Classifier Head
+        t0 = now_ms();
         set_linear_args(k_linear, d_buf2, d_cls_out, d_networks[150], d_networks[151], dim, NUM_CLASSES, 1);
 
         global_linear[0] = 16; // 1 -> 16 Padding
@@ -207,11 +243,23 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
         clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
+        clFinish(queue);
+        t1 = now_ms();
+        t_encoder += (t1 - t0);
+
+
         // (G) Read Result
+        t0 = now_ms();
         clEnqueueReadBuffer(queue, d_cls_out, CL_TRUE, 0, sizeof(float) * NUM_CLASSES,
             probabilities[img_idx], 0, NULL, NULL);
 
+        clFinish(queue);
+        t1 = now_ms();
+        t_encoder += (t1 - t0);
+
+
         // Softmax (CPU 계산 - 정확도 유지용)
+        t0 = now_ms();
         float max_val = probabilities[img_idx][0];
         for (int k = 1; k < NUM_CLASSES; k++) if (probabilities[img_idx][k] > max_val) max_val = probabilities[img_idx][k];
         float sum_exp = 0.0f;
@@ -220,6 +268,19 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             sum_exp += probabilities[img_idx][k];
         }
         for (int k = 0; k < NUM_CLASSES; k++) probabilities[img_idx][k] /= sum_exp;
+
+        clFinish(queue);
+        t1 = now_ms();
+        t_encoder += (t1 - t0);
+
+        double t_total = t_upload + t_patch_embed + t_encoder
+            + t_final_ln + t_head + t_read + t_softmax;
+
+        printf("[IMG %d] upload=%.3f ms, patch=%.3f ms, encoder=%.3f ms, "
+            "final_ln=%.3f ms, head=%.3f ms, read=%.3f ms, softmax=%.3f ms, total=%.3f ms\n",
+            img_idx,
+            t_upload, t_patch_embed, t_encoder,
+            t_final_ln, t_head, t_read, t_softmax, t_total);
     }
 
     // 4. Clean up
