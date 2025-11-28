@@ -7,6 +7,7 @@
 #define NUM_HEADS 12
 #define HEAD_DIM 64 // 768 / 12
 #define EPS 1e-6f
+#define TS 16
 
 // 1. Patch Embedding (Conv2d)
 // Global Size: (total_patches * embed_dim) -> (196 * 768)
@@ -116,29 +117,78 @@ __kernel void layer_norm_kernel(__global const float* input,
 }
 
 // 4. Linear Layer (Matrix Multiplication)
-// Global Size: (tokens, out_features)
+ //Global Size: (tokens, out_features)
 __kernel void linear_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
     __global const float* bias,
     int in_features,
-    int out_features)
+    int out_features,
+    int tokens) // tokens 인자 필수!
 {
-    int t = get_global_id(0); // Token Index
-    int o = get_global_id(1); // Output Feature Index
+    // Global ID: (row=Token, col=OutFeature)
+    int row = get_global_id(0);
+    int col = get_global_id(1);
 
-    // 범위 체크는 Host에서 Global Size를 잘 잡으면 생략 가능하지만 안전을 위해
-    if (o >= out_features) return;
+    // Local ID
+    int local_row = get_local_id(0);
+    int local_col = get_local_id(1);
 
-    float sum = bias[o];
-    int w_offset = o * in_features;
-    int in_offset = t * in_features;
+    // Group ID (WorkGroup Index)
+    int group_col = get_group_id(1); // Out Feature Block Index
 
-    for (int i = 0; i < in_features; i++) {
-        sum += input[in_offset + i] * weight[w_offset + i];
+    // Local Memory
+    __local float As[TS][TS]; // Input Tile
+    __local float Bs[TS][TS]; // Weight Tile
+
+    float sum = 0.0f;
+    int num_tiles = (in_features + TS - 1) / TS;
+
+    for (int t = 0; t < num_tiles; t++) {
+        // 1. Load Input Tile (As)
+        // As[local_row][local_col] <--- Input[row][t*TS + local_col]
+        int tiled_in_idx = t * TS + local_col;
+
+        if (row < tokens && tiled_in_idx < in_features)
+            As[local_row][local_col] = input[row * in_features + tiled_in_idx];
+        else
+            As[local_row][local_col] = 0.0f;
+
+        // 2. Load Weight Tile (Bs)
+        // Weight Shape: [Out_Features, In_Features]
+        // 우리가 필요한 Weight Block: Rows(Out) = group_col*TS ~ +16, Cols(In) = t*TS ~ +16
+        // 로딩 방식: 스레드들이 협력해서 Weight의 16x16 블록을 Bs에 복사
+        // Bs[local_row][local_col] <--- Weight[Current_Block_Out_Row][Current_Block_In_Col]
+
+        int w_out_row = group_col * TS + local_row; // Weight의 행 (Out Feature)
+        int w_in_col = t * TS + local_col;         // Weight의 열 (In Feature)
+
+        if (w_out_row < out_features && w_in_col < in_features)
+            Bs[local_row][local_col] = weight[w_out_row * in_features + w_in_col];
+        else
+            Bs[local_row][local_col] = 0.0f;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // 3. Compute (Inner Product)
+        // 내 Output 위치 (row, col)을 계산하기 위해
+        // As의 내 row행 (local_row)과
+        // Bs의 내 col행?? -> Bs는 [Out_Idx_Offset][In_Idx] 로 저장됨
+        // 내 col(Out Feature)은 WorkGroup 내에서 'local_col' 번째임.
+        // 하지만 위에서 로딩할 때 Bs[local_row][local_col]에 Weight[... + local_row][... + local_col] 넣음
+        // 즉 Bs의 '행' 인덱스가 Out Feature 인덱스 오프셋임.
+        // 내가 필요한 Weight 행은 Bs[local_col] 행임.
+
+        for (int k = 0; k < TS; k++) {
+            sum += As[local_row][k] * Bs[local_col][k];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    output[t * out_features + o] = sum;
+    if (row < tokens && col < out_features) {
+        output[row * out_features + col] = sum + bias[col];
+    }
 }
 
 // 5. Add Residual (Element-wise add)

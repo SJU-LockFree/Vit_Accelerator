@@ -290,8 +290,6 @@ void mlp_block(float* input, float* output, Network fc1_weight, Network fc1_bias
     int Embed_dim = embed_dim; //768
     int hidden_dim = ((int)(embed_dim * mlp_ratio)); //3072
 
-
-
     float* fc1_out = (float*)malloc(sizeof(float) * tokens * hidden_dim);
 
     linear_layer(input, fc1_out, tokens, embed_dim, hidden_dim, fc1_weight, fc1_bias);

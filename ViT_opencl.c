@@ -14,13 +14,14 @@
 #define NUM_CLASSES 1000
 
 // Helper to set standard linear args
-void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b, int in_f, int out_f) {
+void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b, int in_f, int out_f, int num_tokens) {
     clSetKernelArg(kernel, 0, sizeof(cl_mem), &in);
     clSetKernelArg(kernel, 1, sizeof(cl_mem), &out);
     clSetKernelArg(kernel, 2, sizeof(cl_mem), &w);
     clSetKernelArg(kernel, 3, sizeof(cl_mem), &b);
     clSetKernelArg(kernel, 4, sizeof(int), &in_f);
     clSetKernelArg(kernel, 5, sizeof(int), &out_f);
+    clSetKernelArg(kernel, 6, sizeof(int), &num_tokens);
 }
 
 void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
@@ -51,6 +52,9 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     size_t size_token_dim = sizeof(float) * tokens * dim;           // 197 * 768
     size_t size_token_hidden = sizeof(float) * tokens * hidden_dim; // 197 * 3072 (가장 큼!)
     size_t size_scores = sizeof(float) * NUM_HEADS * tokens * tokens;
+
+    size_t local_linear[2] = { 16, 16 };
+    size_t global_linear[2];
 
     // 입력 이미지 버퍼
     cl_mem d_input_img = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, NULL, &err);
@@ -107,9 +111,14 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             // --- Multi-Head Attention ---
             // 1. Linear Projection (Input: d_buf2 -> Output: d_intermediate)
             // d_intermediate will hold QKV (Size: tokens * 3 * dim) -> Safe!
-            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3);
-            size_t gws_linear_qkv[2] = { tokens, dim * 3 };
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_linear_qkv, NULL, 0, NULL, NULL);
+            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
+
+            // Global Size 패딩: (tokens, 3*dim)을 16의 배수로 올림
+            global_linear[0] = ((tokens + 15) / 16) * 16;
+            global_linear[1] = ((dim * 3 + 15) / 16) * 16;
+
+
+            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
             // 2. Calc Scores
             clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate);
@@ -133,9 +142,12 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             clEnqueueNDRangeKernel(queue, k_attn_val, 3, NULL, gws_val, NULL, 0, NULL, NULL);
 
             // 5. Final Linear (Proj) -> Output: d_residual
-            set_linear_args(k_linear, d_buf2, d_residual, d_networks[net_idx + 4], d_networks[net_idx + 5], dim, dim);
-            size_t gws_linear_proj[2] = { tokens, dim };
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_linear_proj, NULL, 0, NULL, NULL);
+            set_linear_args(k_linear, d_buf2, d_residual, d_networks[net_idx + 4], d_networks[net_idx + 5], dim, dim, tokens);
+
+            global_linear[0] = ((tokens + 15) / 16) * 16;
+            global_linear[1] = ((dim + 15) / 16) * 16;
+
+            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
             // --- Residual Add 1 ---
             clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual);
@@ -178,9 +190,12 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             // 1. FC1: d_buf2 -> d_intermediate
             // ★중요★: 여기서 d_intermediate는 Hidden Dim (4배) 크기의 데이터를 받습니다.
             // 이전 코드에서는 여기가 size_qkv(3배)여서 터졌던 것입니다.
-            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim);
-            size_t gws_mlp1[2] = { tokens, hidden_dim };
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_mlp1, NULL, 0, NULL, NULL);
+            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
+
+            global_linear[0] = ((tokens + 15) / 16) * 16;
+            global_linear[1] = ((hidden_dim + 15) / 16) * 16;
+
+            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
             // 2. GELU
             clSetKernelArg(k_gelu, 0, sizeof(cl_mem), &d_intermediate);
@@ -191,7 +206,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             set_linear_args(k_linear, d_intermediate, d_residual, d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim);
             size_t gws_mlp2[2] = { tokens, dim };
             clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_mlp2, NULL, 0, NULL, NULL);
-            
+
             // --- Residual Add 2 ---
             clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual);
             clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1);
@@ -209,9 +224,12 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
         // (F) Classifier Head
-        set_linear_args(k_linear, d_buf2, d_cls_out, d_networks[150], d_networks[151], dim, NUM_CLASSES);
-        size_t gws_head[2] = { 1, NUM_CLASSES };
-        clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, gws_head, NULL, 0, NULL, NULL);
+        set_linear_args(k_linear, d_buf2, d_cls_out, d_networks[150], d_networks[151], dim, NUM_CLASSES, 1);
+
+        global_linear[0] = 16; // 1 -> 16 Padding
+        global_linear[1] = ((NUM_CLASSES + 15) / 16) * 16;
+
+        clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
         // [변경] (G) GPU Softmax 수행
         clSetKernelArg(k_final_softmax, 0, sizeof(cl_mem), &d_cls_out);
@@ -253,7 +271,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     clReleaseMemObject(d_buf1);
     clReleaseMemObject(d_buf2);
     clReleaseMemObject(d_residual);
-    clReleaseMemObject(d_intermediate); // 변경된 이름 해제
+    clReleaseMemObject(d_intermediate);
     clReleaseMemObject(d_scores);
     clReleaseMemObject(d_cls_out);
 
