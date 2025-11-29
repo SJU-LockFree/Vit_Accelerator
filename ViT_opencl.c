@@ -15,6 +15,16 @@
 #define NUM_CLASSES 1000
 #define NUM_STREAMS 4
 
+
+double t_upload = 0.0;
+double t_patch_embed = 0.0;
+double t_encoder = 0.0;
+double t_final_ln = 0.0;
+double t_head = 0.0;
+double t_read = 0.0;
+double t_softmax = 0.0;
+double t0, t1;
+
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
 }
@@ -30,11 +40,24 @@ void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b
     clSetKernelArg(kernel, 6, sizeof(int), &num_tokens);
 }
 
+/* 시간 측정 단위 초기화 */
+void reset_timer() {
+    t_upload = 0.0;
+    t_patch_embed = 0.0;
+    t_encoder = 0.0;
+    t_final_ln = 0.0;
+    t_head = 0.0;
+    t_read = 0.0;
+    t_softmax = 0.0;
+}
+
 /* [ 수정 ] : 디바이스를 추가 인자로 받음 */
 void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_context context, cl_command_queue queue, cl_program program, cl_device_id device)
 {
+    // 0. 기타 변수 생성
     cl_int err;
+
 
     // 1. 커널 생성
     cl_kernel k_conv2d = clCreateKernel(program, "conv2d_kernel", &err);
@@ -46,6 +69,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_attn_score = clCreateKernel(program, "attn_score_kernel", &err);
     cl_kernel k_softmax = clCreateKernel(program, "softmax_kernel", &err);
     cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);    
+
 
     // 2. 버퍼 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -61,6 +85,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     size_t local_linear[2] = { 16, 16 };
     size_t global_linear[2];
 
+
     /* [ 수정 ] */
     // 3. 스트림별 리소스 할당 (배열로 선언)
     cl_command_queue queues[NUM_STREAMS];
@@ -72,6 +97,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_mem d_scores[NUM_STREAMS];           // Attention Score 버퍼
     cl_mem d_cls_out[NUM_STREAMS];          // 최종 Output 버퍼
 
+    // 커맨드 큐와 버퍼 생성
     for (int i = 0; i < NUM_STREAMS; i++) {
         // 커맨드 큐 생성 (Out-of-order가 아닌 일반 큐도 무방, 여기선 독립된 큐 사용)
         queues[i] = clCreateCommandQueueWithProperties(context, device, 0, &err);
@@ -117,16 +143,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             // printf("Image %d Processed on Stream %d\n", finished_img_idx, stream_id);
         }
 
-        // 타이머 변수
-        double t_upload = 0.0;
-        double t_patch_embed = 0.0;
-        double t_encoder = 0.0;
-        double t_final_ln = 0.0;
-        double t_head = 0.0;
-        double t_read = 0.0;
-        double t_softmax = 0.0;
-        double t0, t1;
-
+        // 타이머 변수 리셋
+        reset_timer();
 
         // [New Work] 처리할 이미지가 남았다면 새로운 작업 Enqueue
         if (i < image->n) { 
@@ -156,7 +174,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             size_t gws_prep[1] = { tokens * dim };
             clEnqueueNDRangeKernel(queues[stream_id], k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
 
-            clFinish(queue);
+            //clFinish(queue);
             t1 = now_ms();
             t_patch_embed += (t1 - t0);
 
@@ -167,7 +185,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             for (int i = 0; i < 12; i++) {
                 // --- Multi-Head Attention ---
 
-                /*LN 1*/
+                /* LN 1 */
                 clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
                 clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2[stream_id]);
                 clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 0]);
@@ -175,6 +193,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 size_t gws_ln[1] = { tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
+
+                /* MHA */
                 // MHA - Linear 1
                 set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
                 global_linear[0] = ((tokens + 15) / 16) * 16;
@@ -214,13 +234,16 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 size_t gws_add[1] = { tokens * dim };
                 clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
 
-                // LN 2
+
+                /* LN 2 */ 
                 clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
                 clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2[stream_id]);
                 clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 6]);
                 clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 7]);
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
+
+                /* MLP */
                 // MLP - FC1
                 set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
                 global_linear[0] = ((tokens + 15) / 16) * 16;
@@ -249,6 +272,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             t1 = now_ms();
             t_encoder += (t1 - t0);
 
+
             // (E) Final Layer Norm
             t0 = now_ms();
 
@@ -261,6 +285,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
             t1 = now_ms();
             t_encoder += (t1 - t0);
+
 
             // (F) Classifier Head
             t0 = now_ms();
