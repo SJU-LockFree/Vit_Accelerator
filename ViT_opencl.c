@@ -13,7 +13,7 @@
 #define NUM_HEADS 12
 #define HEAD_DIM 64
 #define NUM_CLASSES 1000
-#define NUM_STREAMS 2
+#define NUM_STREAMS 4
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
