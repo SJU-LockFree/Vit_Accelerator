@@ -13,6 +13,7 @@
 #define NUM_HEADS 12
 #define HEAD_DIM 64
 #define NUM_CLASSES 1000
+#define NUM_STREAMS 2
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
@@ -29,8 +30,9 @@ void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b
     clSetKernelArg(kernel, 6, sizeof(int), &num_tokens);
 }
 
+/* [ 수정 ] : 디바이스를 추가 인자로 받음 */
 void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
-    cl_context context, cl_command_queue queue, cl_program program)
+    cl_context context, cl_command_queue queue, cl_program program, cl_device_id device)
 {
     cl_int err;
 
@@ -59,25 +61,61 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     size_t local_linear[2] = { 16, 16 };
     size_t global_linear[2];
 
-    // 입력 이미지 버퍼
-    cl_mem d_input_img = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, NULL, &err);
+    /* [ 수정 ] */
+    // 3. 스트림별 리소스 할당 (배열로 선언)
+    cl_command_queue queues[NUM_STREAMS];
+    cl_mem d_input_img[NUM_STREAMS];        // 입력 이미지 버퍼
+    cl_mem d_buf1[NUM_STREAMS];             // 메인 버퍼 (Ping-Pong용)
+    cl_mem d_buf2[NUM_STREAMS];             
+    cl_mem d_residual[NUM_STREAMS];
+    cl_mem d_intermediate[NUM_STREAMS];     // ★수정됨★: QKV 뿐만 아니라 MLP의 Hidden Layer(4배)도 담을 수 있도록 가장 큰 크기로 할당
+    cl_mem d_scores[NUM_STREAMS];           // Attention Score 버퍼
+    cl_mem d_cls_out[NUM_STREAMS];          // 최종 Output 버퍼
 
-    // 메인 버퍼 (Ping-Pong용)
-    cl_mem d_buf1 = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
-    cl_mem d_buf2 = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
-    cl_mem d_residual = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_dim, NULL, &err);
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        // 커맨드 큐 생성 (Out-of-order가 아닌 일반 큐도 무방, 여기선 독립된 큐 사용)
+        queues[i] = clCreateCommandQueueWithProperties(context, device, 0, &err);
 
-    // ★수정됨★: QKV 뿐만 아니라 MLP의 Hidden Layer(4배)도 담을 수 있도록 가장 큰 크기로 할당
-    cl_mem d_intermediate = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
+        // 버퍼 생성 (각 스트림별로 독립적인 공간)
+        d_input_img[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, NULL, &err);
+        d_buf1[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
+        d_buf2[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
+        d_residual[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_dim, NULL, &err);
+        d_intermediate[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
+        d_scores[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_scores, NULL, &err);
+        d_cls_out[i] = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * NUM_CLASSES, NULL, &err);
+    }
 
-    // Attention Score 버퍼
-    cl_mem d_scores = clCreateBuffer(context, CL_MEM_READ_WRITE, size_scores, NULL, &err);
+   
+    // 4. Inference Loop
+    for (int i = 0; i < image->n + NUM_STREAMS; i++) {
+        int stream_id = i % NUM_STREAMS;
 
-    // 최종 Output 버퍼
-    cl_mem d_cls_out = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * NUM_CLASSES, NULL, &err);
+        // [SYNC] 해당 스트림의 이전 작업이 끝날 때까지 대기
+        // (이 시점에서 이전 이미지는 d_cls_out에 결과가 들어와 있고, 전송도 끝난 상태임)
+        clFinish(queues[stream_id]);
 
-    // 3. Inference Loop
-    for (int img_idx = 0; img_idx < image->n; img_idx++) {
+        // [CPU Post-processing] 완료된 이전 이미지의 Softmax 계산
+        // 현재 인덱스 i에서 NUM_STREAMS만큼 뺀 인덱스가 방금 완료된 이미지임
+        int finished_img_idx = i - NUM_STREAMS;
+
+        if (finished_img_idx >= 0 && finished_img_idx < image->n) {
+            // Softmax 수행 (Host 메모리인 probabilities에는 이미 값이 비동기로 복사되어 있음)
+            float max_val = probabilities[finished_img_idx][0];
+            for (int k = 1; k < NUM_CLASSES; k++)
+                if (probabilities[finished_img_idx][k] > max_val) max_val = probabilities[finished_img_idx][k];
+
+            float sum_exp = 0.0f;
+            for (int k = 0; k < NUM_CLASSES; k++) {
+                probabilities[finished_img_idx][k] = exp(probabilities[finished_img_idx][k] - max_val);
+                sum_exp += probabilities[finished_img_idx][k];
+            }
+            for (int k = 0; k < NUM_CLASSES; k++)
+                probabilities[finished_img_idx][k] /= sum_exp;
+
+            // 진행 상황 출력 (선택)
+            // printf("Image %d Processed on Stream %d\n", finished_img_idx, stream_id);
+        }
 
         // 타이머 변수
         double t_upload = 0.0;
@@ -89,208 +127,184 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         double t_softmax = 0.0;
         double t0, t1;
 
-        // (A) 이미지 복사 Host -> GPU
-        t0 = now_ms();
-        clEnqueueWriteBuffer(queue, d_input_img, CL_TRUE, 0, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE,
-            &image[img_idx].data[0], 0, NULL, NULL);
-        t1 = now_ms();
-        t_upload += (t1 - t0);
 
-        // (B) Patch Embedding
-        t0 = now_ms();
-        clSetKernelArg(k_conv2d, 0, sizeof(cl_mem), &d_input_img);
-        clSetKernelArg(k_conv2d, 1, sizeof(cl_mem), &d_buf2);
-        clSetKernelArg(k_conv2d, 2, sizeof(cl_mem), &d_networks[1]);
-        clSetKernelArg(k_conv2d, 3, sizeof(cl_mem), &d_networks[2]);
-        size_t gws_conv[1] = { num_patches * dim };
-        clEnqueueNDRangeKernel(queue, k_conv2d, 1, NULL, gws_conv, NULL, 0, NULL, NULL);
+        // [New Work] 처리할 이미지가 남았다면 새로운 작업 Enqueue
+        if (i < image->n) { 
+            int img_idx = i;
 
-        // (C) CLS Token + Pos Embedding
-        clSetKernelArg(k_prep, 0, sizeof(cl_mem), &d_buf2);
-        clSetKernelArg(k_prep, 1, sizeof(cl_mem), &d_buf1);
-        clSetKernelArg(k_prep, 2, sizeof(cl_mem), &d_networks[0]);
-        clSetKernelArg(k_prep, 3, sizeof(cl_mem), &d_networks[3]);
-        size_t gws_prep[1] = { tokens * dim };
-        clEnqueueNDRangeKernel(queue, k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
+            // (A) 이미지 복사 Host -> GPU
+            t0 = now_ms();
+            clEnqueueWriteBuffer(queues[stream_id], d_input_img[stream_id], CL_FALSE, 0,
+                sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, &image[i].data[0], 0, NULL, NULL);
+            t1 = now_ms();
+            t_upload += (t1 - t0);
 
-        clFinish(queue);
-        t1 = now_ms();
-        t_patch_embed += (t1 - t0);
+            // (B) Patch Embedding
+            t0 = now_ms();
+            clSetKernelArg(k_conv2d, 0, sizeof(cl_mem), &d_input_img[stream_id]); // 스트림별 버퍼
+            clSetKernelArg(k_conv2d, 1, sizeof(cl_mem), &d_buf2[stream_id]);       // 스트림별 버퍼
+            clSetKernelArg(k_conv2d, 2, sizeof(cl_mem), &d_networks[1]);           // 읽기전용(공유)
+            clSetKernelArg(k_conv2d, 3, sizeof(cl_mem), &d_networks[2]);           // 읽기전용(공유)
+            size_t gws_conv[1] = { num_patches * dim };
+            clEnqueueNDRangeKernel(queues[stream_id], k_conv2d, 1, NULL, gws_conv, NULL, 0, NULL, NULL);
 
-        // (D) Encoder Layers
-        t0 = now_ms();
+            // (C) CLS Token + Pos Embedding
+            clSetKernelArg(k_prep, 0, sizeof(cl_mem), &d_buf2[stream_id]);
+            clSetKernelArg(k_prep, 1, sizeof(cl_mem), &d_buf1[stream_id]);
+            clSetKernelArg(k_prep, 2, sizeof(cl_mem), &d_networks[0]);
+            clSetKernelArg(k_prep, 3, sizeof(cl_mem), &d_networks[3]);
+            size_t gws_prep[1] = { tokens * dim };
+            clEnqueueNDRangeKernel(queues[stream_id], k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
 
-        int net_idx = 4;
-        for (int i = 0; i < 12; i++) {
-            // --- LN1 ---
-            clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);
-            clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2);
-            clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 0]);
-            clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 1]);
-            size_t gws_ln[1] = { tokens };
-            clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
+            clFinish(queue);
+            t1 = now_ms();
+            t_patch_embed += (t1 - t0);
 
-            // --- Multi-Head Attention ---
-            // 1. Linear Projection (Input: d_buf2 -> Output: d_intermediate)
-            // d_intermediate will hold QKV (Size: tokens * 3 * dim) -> Safe!
-            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
+            // (D) Encoder Layers
+            t0 = now_ms();
 
-            // Global Size 패딩: (tokens, 3*dim)을 16의 배수로 올림
-            global_linear[0] = ((tokens + 15) / 16) * 16;
-            global_linear[1] = ((dim * 3 + 15) / 16) * 16;
+            int net_idx = 4;
+            for (int i = 0; i < 12; i++) {
+                // --- Multi-Head Attention ---
+
+                /*LN 1*/
+                clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
+                clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2[stream_id]);
+                clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 0]);
+                clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 1]);
+                size_t gws_ln[1] = { tokens };
+                clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
+
+                // MHA - Linear 1
+                set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((dim * 3 + 15) / 16) * 16;
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+                // MHA - Score
+                clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
+                clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);
+                size_t gws_score[3] = { NUM_HEADS, tokens, tokens };
+                clEnqueueNDRangeKernel(queues[stream_id], k_attn_score, 3, NULL, gws_score, NULL, 0, NULL, NULL);
+
+                // MHA - Softmax
+                clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
+                size_t gws_softmax[2] = { NUM_HEADS, tokens };
+                clEnqueueNDRangeKernel(queues[stream_id], k_softmax, 2, NULL, gws_softmax, NULL, 0, NULL, NULL);
+
+                // MHA - Values
+                clSetKernelArg(k_attn_val, 0, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_attn_val, 1, sizeof(cl_mem), &d_intermediate[stream_id]);
+                clSetKernelArg(k_attn_val, 2, sizeof(cl_mem), &d_buf2[stream_id]);
+                clSetKernelArg(k_attn_val, 3, sizeof(int), &tokens);
+                size_t gws_val[3] = { NUM_HEADS, tokens, HEAD_DIM };
+                clEnqueueNDRangeKernel(queues[stream_id], k_attn_val, 3, NULL, gws_val, NULL, 0, NULL, NULL);
+
+                // MHA - Final Linear
+                set_linear_args(k_linear, d_buf2[stream_id], d_residual[stream_id], d_networks[net_idx + 4], d_networks[net_idx + 5], dim, dim, tokens);
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((dim + 15) / 16) * 16;
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+                // Add 1
+                clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
+                clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
+                size_t gws_add[1] = { tokens * dim };
+                clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+
+                // LN 2
+                clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
+                clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2[stream_id]);
+                clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 6]);
+                clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 7]);
+                clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
+
+                // MLP - FC1
+                set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((hidden_dim + 15) / 16) * 16;
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+                // MLP - GELU
+                clSetKernelArg(k_gelu, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
+                size_t gws_gelu[1] = { tokens * hidden_dim };
+                clEnqueueNDRangeKernel(queues[stream_id], k_gelu, 1, NULL, gws_gelu, NULL, 0, NULL, NULL);
+
+                // MLP - FC2
+                set_linear_args(k_linear, d_intermediate[stream_id], d_residual[stream_id], d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim, tokens);
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((dim + 15) / 16) * 16;
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+                // Add 2
+                clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
+                clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
+                clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+
+                net_idx += 12;
+            }
+
+            t1 = now_ms();
+            t_encoder += (t1 - t0);
+
+            // (E) Final Layer Norm
+            t0 = now_ms();
+
+            clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
+            clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2[stream_id]);
+            clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[148]);
+            clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[149]);
+            size_t gws_ln_final[1] = { tokens };
+            clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln_final, NULL, 0, NULL, NULL);
+
+            t1 = now_ms();
+            t_encoder += (t1 - t0);
+
+            // (F) Classifier Head
+            t0 = now_ms();
+
+            set_linear_args(k_linear, d_buf2[stream_id], d_cls_out[stream_id], d_networks[150], d_networks[151], dim, NUM_CLASSES, 1);
+            global_linear[0] = 16;
+            global_linear[1] = ((NUM_CLASSES + 15) / 16) * 16;
+            clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+            t1 = now_ms();
+            t_encoder += (t1 - t0);
 
 
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+            // (G) Read Result
+            t0 = now_ms();
+            clEnqueueReadBuffer(queues[stream_id], d_cls_out[stream_id], CL_FALSE, 0,
+                sizeof(float) * NUM_CLASSES, probabilities[img_idx], 0, NULL, NULL);
 
-            // 2. Calc Scores
-            clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate);
-            clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores);
-            clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);
-            size_t gws_score[3] = { NUM_HEADS, tokens, tokens };
-            clEnqueueNDRangeKernel(queue, k_attn_score, 3, NULL, gws_score, NULL, 0, NULL, NULL);
+            t1 = now_ms();
+            t_encoder += (t1 - t0);
 
-            // 3. Softmax
-            clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores);
-            clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
-            size_t gws_softmax[2] = { NUM_HEADS, tokens };
-            clEnqueueNDRangeKernel(queue, k_softmax, 2, NULL, gws_softmax, NULL, 0, NULL, NULL);
 
-            // 4. Calc Values (Scores * V) -> Output: d_buf2
-            clSetKernelArg(k_attn_val, 0, sizeof(cl_mem), &d_scores);
-            clSetKernelArg(k_attn_val, 1, sizeof(cl_mem), &d_intermediate);
-            clSetKernelArg(k_attn_val, 2, sizeof(cl_mem), &d_buf2);
-            clSetKernelArg(k_attn_val, 3, sizeof(int), &tokens);
-            size_t gws_val[3] = { NUM_HEADS, tokens, HEAD_DIM };
-            clEnqueueNDRangeKernel(queue, k_attn_val, 3, NULL, gws_val, NULL, 0, NULL, NULL);
+            double t_total = t_upload + t_patch_embed + t_encoder
+                + t_final_ln + t_head + t_read + t_softmax;
 
-            // 5. Final Linear (Proj) -> Output: d_residual
-            set_linear_args(k_linear, d_buf2, d_residual, d_networks[net_idx + 4], d_networks[net_idx + 5], dim, dim, tokens);
-
-            global_linear[0] = ((tokens + 15) / 16) * 16;
-            global_linear[1] = ((dim + 15) / 16) * 16;
-
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-            // --- Residual Add 1 ---
-            clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual);
-            clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1);
-            size_t gws_add[1] = { tokens * dim };
-            clEnqueueNDRangeKernel(queue, k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
-
-            // --- LN2 ---
-            clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);
-            clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2);
-            clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 6]);
-            clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 7]);
-            clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
-
-            // --- MLP ---
-            // 1. FC1: d_buf2 -> d_intermediate
-            // ★중요★: 여기서 d_intermediate는 Hidden Dim (4배) 크기의 데이터를 받습니다.
-            // 이전 코드에서는 여기가 size_qkv(3배)여서 터졌던 것입니다.
-            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
-
-            global_linear[0] = ((tokens + 15) / 16) * 16;
-            global_linear[1] = ((hidden_dim + 15) / 16) * 16;
-
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-            // 2. GELU
-            clSetKernelArg(k_gelu, 0, sizeof(cl_mem), &d_intermediate);
-            size_t gws_gelu[1] = { tokens * hidden_dim };
-            clEnqueueNDRangeKernel(queue, k_gelu, 1, NULL, gws_gelu, NULL, 0, NULL, NULL);        
-            
-            // 3. FC2: d_intermediate -> d_residual
-            set_linear_args(k_linear, d_intermediate, d_residual, d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim, tokens);
-
-            global_linear[0] = ((tokens + 15) / 16) * 16;
-            global_linear[1] = ((dim + 15) / 16) * 16;
-
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-            // --- Residual Add 2 ---
-            clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual);
-            clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1);
-            clEnqueueNDRangeKernel(queue, k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
-
-            net_idx += 12;
+            printf("[IMG %d] upload=%.3f ms, patch=%.3f ms, encoder=%.3f ms, "
+                "final_ln=%.3f ms, head=%.3f ms, read=%.3f ms, softmax=%.3f ms, total=%.3f ms\n",
+                img_idx,
+                t_upload, t_patch_embed, t_encoder,
+                t_final_ln, t_head, t_read, t_softmax, t_total);
         }
-
-        clFinish(queue);
-        t1 = now_ms();
-        t_encoder += (t1 - t0);
-
-        // (E) Final Layer Norm
-        t0 = now_ms();
-
-        clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);
-        clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2);
-        clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[148]);
-        clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[149]);
-        size_t gws_ln[1] = { tokens };
-        clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
-
-        clFinish(queue);
-        t1 = now_ms();
-        t_encoder += (t1 - t0);
-
-        // (F) Classifier Head
-        t0 = now_ms();
-        set_linear_args(k_linear, d_buf2, d_cls_out, d_networks[150], d_networks[151], dim, NUM_CLASSES, 1);
-
-        global_linear[0] = 16; // 1 -> 16 Padding
-        global_linear[1] = ((NUM_CLASSES + 15) / 16) * 16;
-
-        clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-        clFinish(queue);
-        t1 = now_ms();
-        t_encoder += (t1 - t0);
-
-
-        // (G) Read Result
-        t0 = now_ms();
-        clEnqueueReadBuffer(queue, d_cls_out, CL_TRUE, 0, sizeof(float) * NUM_CLASSES,
-            probabilities[img_idx], 0, NULL, NULL);
-
-        clFinish(queue);
-        t1 = now_ms();
-        t_encoder += (t1 - t0);
-
-
-        // Softmax (CPU 계산 - 정확도 유지용)
-        t0 = now_ms();
-        float max_val = probabilities[img_idx][0];
-        for (int k = 1; k < NUM_CLASSES; k++) if (probabilities[img_idx][k] > max_val) max_val = probabilities[img_idx][k];
-        float sum_exp = 0.0f;
-        for (int k = 0; k < NUM_CLASSES; k++) {
-            probabilities[img_idx][k] = exp(probabilities[img_idx][k] - max_val);
-            sum_exp += probabilities[img_idx][k];
-        }
-        for (int k = 0; k < NUM_CLASSES; k++) probabilities[img_idx][k] /= sum_exp;
-
-        clFinish(queue);
-        t1 = now_ms();
-        t_encoder += (t1 - t0);
-
-        double t_total = t_upload + t_patch_embed + t_encoder
-            + t_final_ln + t_head + t_read + t_softmax;
-
-        printf("[IMG %d] upload=%.3f ms, patch=%.3f ms, encoder=%.3f ms, "
-            "final_ln=%.3f ms, head=%.3f ms, read=%.3f ms, softmax=%.3f ms, total=%.3f ms\n",
-            img_idx,
-            t_upload, t_patch_embed, t_encoder,
-            t_final_ln, t_head, t_read, t_softmax, t_total);
     }
 
-    // 4. Clean up
-    clReleaseMemObject(d_input_img);
-    clReleaseMemObject(d_buf1);
-    clReleaseMemObject(d_buf2);
-    clReleaseMemObject(d_residual);
-    clReleaseMemObject(d_intermediate);
-    clReleaseMemObject(d_scores);
-    clReleaseMemObject(d_cls_out);
+    // 5. 리소스 해제 (반복문 사용)
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        clReleaseCommandQueue(queues[i]);
+        clReleaseMemObject(d_input_img[i]);
+        clReleaseMemObject(d_buf1[i]);
+        clReleaseMemObject(d_buf2[i]);
+        clReleaseMemObject(d_residual[i]);
+        clReleaseMemObject(d_intermediate[i]);
+        clReleaseMemObject(d_scores[i]);
+        clReleaseMemObject(d_cls_out[i]);
+    }
 
     clReleaseKernel(k_conv2d);
     clReleaseKernel(k_prep);

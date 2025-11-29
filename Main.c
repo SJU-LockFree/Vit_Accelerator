@@ -133,7 +133,7 @@ int main() {
 
     // ★ 핵심: ViT_opencl 함수 호출 (OpenCL 버전)
     // 이 함수 안에서 각 레이어별 커널(kernel)을 생성하고 실행해야 함
-    ViT_opencl(images, d_network, probabilities, context, queue, program);
+    ViT_opencl(images, d_network, probabilities, context, queue, program, device_id);
 
     // 대기열의 모든 명령이 끝날 때까지 대기 (그래야 정확한 시간 측정 가능)
     clFinish(queue);
