@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <time.h>
 #include <CL/cl.h>
 #include "Network.h"
@@ -17,6 +18,38 @@
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+}
+
+static cl_half float_to_half_bits(float f)
+{
+    union { float f; uint32_t u; } v = { f };
+
+    uint32_t sign = (v.u >> 31) & 0x1;
+    int32_t  exp = (int32_t)((v.u >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (v.u >> 13) & 0x3FF;
+
+    uint16_t h;
+
+    if (exp <= 0) {
+        // subnormal or zero
+        if (exp < -10) {
+            h = (uint16_t)(sign << 15);
+        }
+        else {
+            mant = (mant | 0x400) >> (1 - exp);
+            h = (uint16_t)((sign << 15) | mant);
+        }
+    }
+    else if (exp >= 0x1F) {
+        // inf or NaN
+        h = (uint16_t)((sign << 15) | (0x1F << 10));
+        if (mant) h |= mant; // NaN 유지
+    }
+    else {
+        h = (uint16_t)((sign << 15) | ((exp & 0x1F) << 10) | mant);
+    }
+
+    return (cl_half)h;
 }
 
 // Helper to set standard linear args
@@ -61,6 +94,9 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     size_t local_linear[2] = { 16, 16 };
     size_t global_linear[2];
 
+    size_t img_elems = 3 * IMG_SIZE * IMG_SIZE;
+    size_t img_bytes = sizeof(cl_half) * img_elems;
+
     /* [ 수정 ] */
     // 3. 스트림별 리소스 할당 (배열로 선언)
     cl_command_queue queues[NUM_STREAMS];
@@ -71,19 +107,23 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_mem d_intermediate[NUM_STREAMS];     // ★수정됨★: QKV 뿐만 아니라 MLP의 Hidden Layer(4배)도 담을 수 있도록 가장 큰 크기로 할당
     cl_mem d_scores[NUM_STREAMS];           // Attention Score 버퍼
     cl_mem d_cls_out[NUM_STREAMS];          // 최종 Output 버퍼
+    cl_half* h_input_img[NUM_STREAMS];
 
     for (int i = 0; i < NUM_STREAMS; i++) {
         // 커맨드 큐 생성 (Out-of-order가 아닌 일반 큐도 무방, 여기선 독립된 큐 사용)
         queues[i] = clCreateCommandQueueWithProperties(context, device, 0, &err);
 
+        
+
         // 버퍼 생성 (각 스트림별로 독립적인 공간)
-        d_input_img[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, NULL, &err);
+        d_input_img[i] = clCreateBuffer(context, CL_MEM_READ_ONLY, sizeof(cl_half) * img_elems, NULL, &err);
         d_buf1[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
         d_buf2[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
         d_residual[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_dim, NULL, &err);
         d_intermediate[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_token_hidden, NULL, &err);
         d_scores[i] = clCreateBuffer(context, CL_MEM_READ_WRITE, size_scores, NULL, &err);
         d_cls_out[i] = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(float) * NUM_CLASSES, NULL, &err);
+        h_input_img[i] = (cl_half*)malloc(sizeof(cl_half) * img_elems);
     }
 
    
@@ -134,8 +174,20 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
             // (A) 이미지 복사 Host -> GPU
             t0 = now_ms();
+
+            // 1) float → half 변환 (host side)
+            size_t img_elems = 3 * IMG_SIZE * IMG_SIZE;
+            float* src = image[i].data;  // ImageData가 float* data 라고 가정
+            for (size_t p = 0; p < img_elems; ++p) {
+                h_input_img[stream_id][p] = float_to_half_bits(src[p]);
+            }
+
+            // 2) half 버퍼를 그대로 GPU로 전송
             clEnqueueWriteBuffer(queues[stream_id], d_input_img[stream_id], CL_FALSE, 0,
-                sizeof(float) * 3 * IMG_SIZE * IMG_SIZE, &image[i].data[0], 0, NULL, NULL);
+                sizeof(cl_half) * img_elems,       // ★ sizeof(float) → sizeof(cl_half)
+                h_input_img[stream_id],            // ★ &image[i].data[0] → half 버퍼
+                0, NULL, NULL);
+
             t1 = now_ms();
             t_upload += (t1 - t0);
 
@@ -156,7 +208,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             size_t gws_prep[1] = { tokens * dim };
             clEnqueueNDRangeKernel(queues[stream_id], k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
 
-            clFinish(queue);
+            clFinish(queues[stream_id]);
             t1 = now_ms();
             t_patch_embed += (t1 - t0);
 
@@ -182,9 +234,9 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
                 // MHA - Score
-                clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
-                clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores[stream_id]);
-                clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);
+                clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate[stream_id]); // qkv
+                clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores[stream_id]);       // scores
+                clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);                       // total_tokens
                 size_t gws_score[3] = { NUM_HEADS, tokens, tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_attn_score, 3, NULL, gws_score, NULL, 0, NULL, NULL);
 
@@ -304,6 +356,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         clReleaseMemObject(d_intermediate[i]);
         clReleaseMemObject(d_scores[i]);
         clReleaseMemObject(d_cls_out[i]);
+        free(h_input_img[i]);
     }
 
     clReleaseKernel(k_conv2d);
