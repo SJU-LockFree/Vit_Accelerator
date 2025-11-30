@@ -174,7 +174,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             size_t gws_prep[1] = { tokens * dim };
             clEnqueueNDRangeKernel(queues[stream_id], k_prep, 1, NULL, gws_prep, NULL, 0, NULL, NULL);
 
-            //clFinish(queue);
+            clFinish(queue);
             t1 = now_ms();
             t_patch_embed += (t1 - t0);
 
@@ -193,6 +193,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 size_t gws_ln[1] = { tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
+                clFinish(queue);
 
                 /* MHA */
                 // MHA - Linear 1
@@ -209,10 +210,20 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clEnqueueNDRangeKernel(queues[stream_id], k_attn_score, 3, NULL, gws_score, NULL, 0, NULL, NULL);
 
                 // MHA - Softmax
+                /*
+                // [ 변경 전 ]
                 clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores[stream_id]);
                 clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
                 size_t gws_softmax[2] = { NUM_HEADS, tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_softmax, 2, NULL, gws_softmax, NULL, 0, NULL, NULL);
+                */
+                // [ 변경 후 ]
+                clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
+                size_t lws_softmax[1] = { 256 };
+                size_t gws_softmax[1] = { NUM_HEADS * tokens * lws_softmax[0] };
+                clEnqueueNDRangeKernel(queues[stream_id], k_softmax, 1, NULL, gws_softmax, lws_softmax, 0, NULL, NULL);
+
 
                 // MHA - Values
                 clSetKernelArg(k_attn_val, 0, sizeof(cl_mem), &d_scores[stream_id]);
@@ -242,6 +253,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 7]);
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
+                clFinish(queue);
+
 
                 /* MLP */
                 // MLP - FC1
@@ -265,6 +278,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
                 clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
                 clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+                
+                clFinish(queue);
 
                 net_idx += 12;
             }
@@ -282,7 +297,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[149]);
             size_t gws_ln_final[1] = { tokens };
             clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln_final, NULL, 0, NULL, NULL);
-
+            clFinish(queue);
+            
             t1 = now_ms();
             t_encoder += (t1 - t0);
 
@@ -294,6 +310,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             global_linear[0] = 16;
             global_linear[1] = ((NUM_CLASSES + 15) / 16) * 16;
             clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+            clFinish(queue);
 
             t1 = now_ms();
             t_encoder += (t1 - t0);
@@ -303,6 +320,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             t0 = now_ms();
             clEnqueueReadBuffer(queues[stream_id], d_cls_out[stream_id], CL_FALSE, 0,
                 sizeof(float) * NUM_CLASSES, probabilities[img_idx], 0, NULL, NULL);
+            clFinish(queue);
 
             t1 = now_ms();
             t_encoder += (t1 - t0);

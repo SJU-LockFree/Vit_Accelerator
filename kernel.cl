@@ -8,6 +8,7 @@
 #define HEAD_DIM 64 // 768 / 12
 #define EPS 1e-6f
 #define TS 16
+#define LWS 256 
 
 // 1. Patch Embedding (Conv2d)
 // Global Size: (total_patches * embed_dim) -> (196 * 768)
@@ -245,32 +246,82 @@ __kernel void attn_score_kernel(__global const float* qkv_input,
 // 각 스레드가 하나의 행(row)을 맡아서 Softmax 처리
 __kernel void softmax_kernel(__global float* scores, int total_tokens)
 {
-    int h = get_global_id(0);
-    int i = get_global_id(1);
+    // ------------------------------------------------------------------
+    // 구조: 
+    // Grid (Global): (NUM_HEADS * total_tokens, 1) -> 틀림.
+    //
+    //   변경 전 : Global Work Size (0): NUM_HEADS * total_tokens * LWS (X) -> 너무 큼
+    //   변경 후 : Global Work Size (0): (Row개수) * LWS 
+    //   여기서는 Row 개수 = NUM_HEADS * total_tokens (Query Token 개수)
+    // ------------------------------------------------------------------
 
-    if (h >= NUM_HEADS || i >= total_tokens) return;
+    int row_idx = get_group_id(0); // 현재 처리할 Row의 인덱스 (Head와 Query를 합친 순번)
+    int tid = get_local_id(0);     // 워크 그룹 내 스레드 ID (0 ~ 255)
 
-    int row_offset = (h * total_tokens + i) * total_tokens;
+    // 해당 Row의 시작 메모리 주소
+    int row_offset = row_idx * total_tokens;
 
-    // Max Find
-    float max_val = scores[row_offset];
-    for (int j = 1; j < total_tokens; j++) {
-        float val = scores[row_offset + j];
-        if (val > max_val) max_val = val;
+    // 로컬 메모리: 리덕션을 위한 공유 버퍼
+    __local float sdata[LWS];
+
+    // -------------------------------------------------------
+    // 1. Parallel Max Finding (Numerical Stability를 위해)
+    // -------------------------------------------------------
+    float local_max = -INFINITY;
+
+    // Grid-Stride Loop (토큰이 LWS보다 많을 경우를 대비)
+    for (int i = tid; i < total_tokens; i += LWS) {
+        float val = scores[row_offset + i];
+        if (val > local_max) local_max = val;
     }
+    sdata[tid] = local_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Exp & Sum
-    float sum_exp = 0.0f;
-    for (int j = 0; j < total_tokens; j++) {
-        float val = exp(scores[row_offset + j] - max_val);
-        scores[row_offset + j] = val;
-        sum_exp += val;
+    // Tree Reduction (Max)
+    for (int s = LWS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sdata[tid + s] > sdata[tid]) {
+                sdata[tid] = sdata[tid + s];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
+    float row_max = sdata[0]; // 해당 Row의 최대값 확정
 
-    // Normalize
-    float inv_sum = 1.0f / sum_exp;
-    for (int j = 0; j < total_tokens; j++) {
-        scores[row_offset + j] *= inv_sum;
+    // -------------------------------------------------------
+    // 2. Parallel Exp & Sum Calculation
+    // -------------------------------------------------------
+    float local_sum = 0.0f;
+
+    for (int i = tid; i < total_tokens; i += LWS) {
+        float val = scores[row_offset + i];
+        val = exp(val - row_max);
+
+        // 메모리 대역폭 절약을 위해 Exp 결과를 미리 저장 (Normalize 단계에서 재사용)
+        // 주의: 아직 정규화되지 않은 값임
+        scores[row_offset + i] = val;
+
+        local_sum += val;
+    }
+    sdata[tid] = local_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Tree Reduction (Sum)
+    for (int s = LWS / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float row_sum = sdata[0];     // 해당 Row의 Exp 합계 확정
+    float inv_sum = 1.0f / row_sum; // 나눗셈은 비싸므로 역수로 변환
+
+    // -------------------------------------------------------
+    // 3. Parallel Normalization
+    // -------------------------------------------------------
+    for (int i = tid; i < total_tokens; i += LWS) {
+        // 이미 Exp 계산된 값을 읽어서 곱하기만 함
+        scores[row_offset + i] *= inv_sum;
     }
 }
 
