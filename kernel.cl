@@ -1,5 +1,7 @@
 // kernel.cl
 
+#pragma OPENCL EXTENSION cl_khr_fp16 : enable
+
 #define PATCH_SIZE 16
 #define IMG_SIZE 224
 #define IN_CHANS 3
@@ -12,7 +14,7 @@
 
 // 1. Patch Embedding (Conv2d)
 // Global Size: (total_patches * embed_dim) -> (196 * 768)
-__kernel void conv2d_kernel(__global const float* input,
+__kernel void conv2d_kernel(__global const half* input,   // ← float → half
     __global float* output,
     __global const float* weight,
     __global const float* bias)
@@ -40,16 +42,19 @@ __kernel void conv2d_kernel(__global const float* input,
                 int input_idx = (ic * IMG_SIZE + ih) * IMG_SIZE + iw;
                 int kernel_idx = ((oc * IN_CHANS + ic) * PATCH_SIZE + kh) * PATCH_SIZE + kw;
 
-                sum += input[input_idx] * weight[kernel_idx];
+                // ★ half → float 변환해서 쓰기 ★
+                float in_val = (float)(input[input_idx]);
+                float w_val = weight[kernel_idx];
+
+                sum += in_val * w_val;
             }
         }
     }
 
-    // ViT는 Flatten & Transpose를 하므로, (Patch, Channel) 순서로 저장해야 함
-    // 원본 코드의 flatten_transpose 역할을 여기서 미리 수행
     // Output Index: patch_idx * EMBED_DIM + oc
     output[patch_idx * EMBED_DIM + oc] = sum;
 }
+
 
 // 2. Class Token 붙이기 + Position Embedding 더하기
 // Global Size: (total_tokens * embed_dim) -> 197 * 768
@@ -90,107 +95,105 @@ __kernel void layer_norm_kernel(__global const float* input,
     __global const float* weight,
     __global const float* bias)
 {
-    int t = get_global_id(0); // Token Index
-    // total_tokens는 인자로 받거나 상수로 정의
+    int t = get_global_id(0); // token index
     int total_tokens = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE) + 1;
-
     if (t >= total_tokens) return;
 
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
     int offset = t * EMBED_DIM;
 
-    // Mean & Variance Calculation
+    // 1) mean, var 계산
+    float sum = 0.0f;
+    float sum_sq = 0.0f;
+
     for (int i = 0; i < EMBED_DIM; i++) {
-        float val = input[offset + i];
-        sum += val;
-        sum_sq += val * val;
+        float v = input[offset + i];
+        sum += v;
+        sum_sq += v * v;
     }
 
-    float mean = sum / EMBED_DIM;
-    float var = sum_sq / EMBED_DIM - mean * mean;
-    float inv_std = 1.0f / sqrt(var + EPS);
+    float mean = sum / (float)EMBED_DIM;
+    float var = sum_sq / (float)EMBED_DIM - mean * mean;
+    float invstd = 1.0f / sqrt(var + EPS);
 
-    // Normalize & Scale & Shift
+    // 2) 정규화 + scale(gamma) + shift(beta)
     for (int i = 0; i < EMBED_DIM; i++) {
-        output[offset + i] = (input[offset + i] - mean) * inv_std * weight[i] + bias[i];
+        float x = input[offset + i];
+        float gamma = weight[i]; // 차원별
+        float beta = bias[i];
+
+        output[offset + i] = (x - mean) * invstd * gamma + beta;
     }
 }
 
+
 // 4. Linear Layer (Matrix Multiplication)
  //Global Size: (tokens, out_features)
+// 4. Linear Layer (Matrix Multiplication, Tiled)
+// Global Size: (tokens, out_features)
+// Local Size : (TS, TS)  // TS = 16
 __kernel void linear_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
     __global const float* bias,
     int in_features,
     int out_features,
-    int tokens) // tokens 인자 필수!
+    int tokens)
 {
-    // Global ID: (row=Token, col=OutFeature)
-    int row = get_global_id(0);
-    int col = get_global_id(1);
+    // 전역 인덱스: 행(row)=token, 열(col)=out_feature
+    int row = get_global_id(0);   // token index
+    int col = get_global_id(1);   // out feature index
 
-    // Local ID
+    // 워크그룹 내 로컬 인덱스
     int local_row = get_local_id(0);
     int local_col = get_local_id(1);
 
-    // Group ID (WorkGroup Index)
-    int group_col = get_group_id(1); // Out Feature Block Index
+    // 타일 크기
+    const int TSz = TS; // 16
 
-    // Local Memory
-    __local float As[TS][TS]; // Input Tile
-    __local float Bs[TS][TS]; // Weight Tile
+    // 로컬 메모리 타일
+    __local float As[TS][TS];  // input 타일  : [token_tile, k_tile]
+    __local float Bs[TS][TS];  // weight 타일 : [k_tile, out_tile]
 
     float sum = 0.0f;
-    int num_tiles = (in_features + TS - 1) / TS;
 
-    for (int t = 0; t < num_tiles; t++) {
-        // 1. Load Input Tile (As)
-        // As[local_row][local_col] <--- Input[row][t*TS + local_col]
-        int tiled_in_idx = t * TS + local_col;
+    // K 방향(in_features)으로 몇 개의 타일이 필요한지
+    int num_tiles = (in_features + TSz - 1) / TSz;
 
-        if (row < tokens && tiled_in_idx < in_features)
-            As[local_row][local_col] = input[row * in_features + tiled_in_idx];
+    for (int t = 0; t < num_tiles; ++t) {
+        int k_base = t * TSz;
+
+        // ---- A 타일 로딩: input[row, k_base + local_col] ----
+        int a_col = k_base + local_col;
+        if (row < tokens && a_col < in_features)
+            As[local_row][local_col] = input[row * in_features + a_col];
         else
             As[local_row][local_col] = 0.0f;
 
-        // 2. Load Weight Tile (Bs)
-        // Weight Shape: [Out_Features, In_Features]
-        // 우리가 필요한 Weight Block: Rows(Out) = group_col*TS ~ +16, Cols(In) = t*TS ~ +16
-        // 로딩 방식: 스레드들이 협력해서 Weight의 16x16 블록을 Bs에 복사
-        // Bs[local_row][local_col] <--- Weight[Current_Block_Out_Row][Current_Block_In_Col]
-
-        int w_out_row = group_col * TS + local_row; // Weight의 행 (Out Feature)
-        int w_in_col = t * TS + local_col;         // Weight의 열 (In Feature)
-
-        if (w_out_row < out_features && w_in_col < in_features)
-            Bs[local_row][local_col] = weight[w_out_row * in_features + w_in_col];
+        // ---- B 타일 로딩: weight[col, k_base + local_row] ----
+        // weight 레이아웃: [out_features, in_features]
+        int b_row = k_base + local_row; // in_feature index
+        if (col < out_features && b_row < in_features)
+            Bs[local_row][local_col] = weight[col * in_features + b_row];
         else
             Bs[local_row][local_col] = 0.0f;
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // 3. Compute (Inner Product)
-        // 내 Output 위치 (row, col)을 계산하기 위해
-        // As의 내 row행 (local_row)과
-        // Bs의 내 col행?? -> Bs는 [Out_Idx_Offset][In_Idx] 로 저장됨
-        // 내 col(Out Feature)은 WorkGroup 내에서 'local_col' 번째임.
-        // 하지만 위에서 로딩할 때 Bs[local_row][local_col]에 Weight[... + local_row][... + local_col] 넣음
-        // 즉 Bs의 '행' 인덱스가 Out Feature 인덱스 오프셋임.
-        // 내가 필요한 Weight 행은 Bs[local_col] 행임.
-
-        for (int k = 0; k < TS; k++) {
-            sum += As[local_row][k] * Bs[local_col][k];
+        // ---- 타일 내 곱셈/누적 ----
+        // As: [local_row][k], Bs: [k][local_col]
+        for (int k = 0; k < TSz; ++k) {
+            sum += As[local_row][k] * Bs[k][local_col];
         }
 
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
+    // 범위 안일 때만 결과 저장
     if (row < tokens && col < out_features) {
         output[row * out_features + col] = sum + bias[col];
     }
 }
+
 
 // 5. Add Residual (Element-wise add)
 // Global Size: (total_elements)
@@ -207,39 +210,41 @@ __kernel void gelu_kernel(__global float* data)
 {
     int idx = get_global_id(0);
     float x = data[idx];
-    // 0.5 * x * (1 + erf(x / sqrt(2)))
     data[idx] = 0.5f * x * (1.0f + erf(x * 0.70710678f));
 }
+
 
 // 7. Attention Score Calculation (Q * K^T)
 // Global Size: (heads, tokens, tokens)
 // Heads: 12, Tokens: 197
-__kernel void attn_score_kernel(__global const float* qkv_input,
+__kernel void attn_score_kernel(__global const float* qkv,
     __global float* scores,
     int total_tokens)
 {
-    int h = get_global_id(0); // Head index
-    int i = get_global_id(1); // Query Token index
-    int j = get_global_id(2); // Key Token index
+    int h = get_global_id(0); // head
+    int i = get_global_id(1); // query token
+    int j = get_global_id(2); // key token
 
     if (h >= NUM_HEADS || i >= total_tokens || j >= total_tokens) return;
 
-    // Input layout assumed: [tokens, 3 * embed_dim] (from linear output)
-    // Actually, user logic computes Q, K, V from separate parts of weight.
-    // Let's assume input is QKV combined result: [tokens, 3, heads, head_dim] is hard to address.
-    // Simplified: Input is (Tokens, 3 * Embed_Dim).
-    // Q Start: 0, K Start: Embed_Dim, V Start: 2*Embed_Dim
-
-    int q_offset = i * (3 * EMBED_DIM) + h * HEAD_DIM;
-    int k_offset = j * (3 * EMBED_DIM) + EMBED_DIM + h * HEAD_DIM;
+    // 한 토큰당 3 * EMBED_DIM float
+    int stride = 3 * EMBED_DIM;
 
     float score = 0.0f;
     for (int d = 0; d < HEAD_DIM; d++) {
-        score += qkv_input[q_offset + d] * qkv_input[k_offset + d];
+        // Q: offset 0 ~ EMBED_DIM-1
+        int q_idx = i * stride + (h * HEAD_DIM + d);
+
+        // K: offset EMBED_DIM ~ 2*EMBED_DIM-1
+        int k_idx = j * stride + (EMBED_DIM + h * HEAD_DIM + d);
+
+        score += qkv[q_idx] * qkv[k_idx];
     }
 
-    scores[(h * total_tokens + i) * total_tokens + j] = score / sqrt((float)HEAD_DIM);
+    scores[(h * total_tokens + i) * total_tokens + j] =
+        score / sqrt((float)HEAD_DIM);
 }
+
 
 // 8. Softmax (Applied per row in scores)
 // Global Size: (heads, tokens)
@@ -261,6 +266,7 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     // 해당 Row의 시작 메모리 주소
     int row_offset = row_idx * total_tokens;
 
+<<<<<<< HEAD
     // 로컬 메모리: 리덕션을 위한 공유 버퍼
     __local float sdata[LWS];
 
@@ -273,10 +279,17 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     for (int i = tid; i < total_tokens; i += LWS) {
         float val = scores[row_offset + i];
         if (val > local_max) local_max = val;
+=======
+    float max_val = scores[row_offset];
+    for (int j = 1; j < total_tokens; j++) {
+        float v = scores[row_offset + j];
+        if (v > max_val) max_val = v;
+>>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
     sdata[tid] = local_max;
     barrier(CLK_LOCAL_MEM_FENCE);
 
+<<<<<<< HEAD
     // Tree Reduction (Max)
     for (int s = LWS / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -285,9 +298,17 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
+=======
+    float sum_exp = 0.0f;
+    for (int j = 0; j < total_tokens; j++) {
+        float ev = exp(scores[row_offset + j] - max_val);
+        scores[row_offset + j] = ev;
+        sum_exp += ev;
+>>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
     float row_max = sdata[0]; // 해당 Row의 최대값 확정
 
+<<<<<<< HEAD
     // -------------------------------------------------------
     // 2. Parallel Exp & Sum Calculation
     // -------------------------------------------------------
@@ -322,33 +343,40 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     for (int i = tid; i < total_tokens; i += LWS) {
         // 이미 Exp 계산된 값을 읽어서 곱하기만 함
         scores[row_offset + i] *= inv_sum;
+=======
+    float inv_sum = 1.0f / sum_exp;
+    for (int j = 0; j < total_tokens; j++) {
+        scores[row_offset + j] *= inv_sum;
+>>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
 }
 
 // 9. Attention Value Calculation (Scores * V)
 // Global Size: (heads, tokens, head_dim)
 __kernel void attn_value_kernel(__global const float* scores,
-    __global const float* qkv_input,
+    __global const float* qkv,
     __global float* attn_output,
     int total_tokens)
 {
-    int h = get_global_id(0);
-    int i = get_global_id(1); // Output Token Index
-    int d = get_global_id(2); // Head Dim Index
+    int h = get_global_id(0); // head
+    int i = get_global_id(1); // query token
+    int d = get_global_id(2); // head dim
 
     if (h >= NUM_HEADS || i >= total_tokens || d >= HEAD_DIM) return;
 
-    int v_base_offset = 2 * EMBED_DIM + h * HEAD_DIM; // V starts at 2*Embed
     int row_offset = (h * total_tokens + i) * total_tokens;
+    int stride = 3 * EMBED_DIM;
 
     float sum = 0.0f;
     for (int j = 0; j < total_tokens; j++) {
-        float score = scores[row_offset + j];
-        float v_val = qkv_input[j * (3 * EMBED_DIM) + v_base_offset + d];
-        sum += score * v_val;
+        float s = scores[row_offset + j];
+
+        // V: offset 2*EMBED_DIM ~ 3*EMBED_DIM-1
+        int v_idx = j * stride + (2 * EMBED_DIM + h * HEAD_DIM + d);
+
+        sum += s * qkv[v_idx];
     }
 
-    // Output should be flattened for next linear layer: [Tokens, Embed_Dim]
-    // Embed_Dim = Heads * Head_Dim
+    // 최종 [tokens, EMBED_DIM]로 저장
     attn_output[i * EMBED_DIM + h * HEAD_DIM + d] = sum;
 }
