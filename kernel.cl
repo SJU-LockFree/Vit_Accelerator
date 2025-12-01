@@ -32,9 +32,11 @@ __kernel void conv2d_kernel(__global const half* input,   // ← float → half
     float sum = bias[oc];
 
     // 커널 윈도우 순회 (16x16x3)
+    #pragma unroll 2
     for (int ic = 0; ic < IN_CHANS; ++ic) {
+        #pragma unroll 2
         for (int kh = 0; kh < PATCH_SIZE; ++kh) {
-            #pragma unroll
+            #pragma unroll 
             for (int kw = 0; kw < PATCH_SIZE; ++kw) {
                 int ih = oh * PATCH_SIZE + kh;
                 int iw = ow * PATCH_SIZE + kw;
