@@ -254,11 +254,17 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     // ------------------------------------------------------------------
     // 구조: 
     // Grid (Global): (NUM_HEADS * total_tokens, 1) -> 틀림.
-    //
-    //   변경 전 : Global Work Size (0): NUM_HEADS * total_tokens * LWS (X) -> 너무 큼
-    //   변경 후 : Global Work Size (0): (Row개수) * LWS 
+    // 변경된 Grid 전략:
+    //   Global Work Size (0): NUM_HEADS * total_tokens * LWS (X) -> 너무 큼
+    //   정확한 전략: Work-Group 하나가 Row 하나를 맡음.
+    //   Global Work Size (0): (NUM_HEADS * total_tokens) * LWS ?? 
+    //   -> 아닙니다. 보통 GWS[0] = (Row개수) * LWS 로 잡습니다.
     //   여기서는 Row 개수 = NUM_HEADS * total_tokens (Query Token 개수)
     // ------------------------------------------------------------------
+
+    // 이 커널은 1차원 GWS를 가정합니다. 
+    // 호스트에서 GlobalSize = (NUM_HEADS * total_tokens) * LWS 로 잡아야 합니다.
+    // 즉, 각 Row마다 LWS(256)개의 스레드가 할당됩니다.
 
     int row_idx = get_group_id(0); // 현재 처리할 Row의 인덱스 (Head와 Query를 합친 순번)
     int tid = get_local_id(0);     // 워크 그룹 내 스레드 ID (0 ~ 255)
@@ -266,7 +272,6 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     // 해당 Row의 시작 메모리 주소
     int row_offset = row_idx * total_tokens;
 
-<<<<<<< HEAD
     // 로컬 메모리: 리덕션을 위한 공유 버퍼
     __local float sdata[LWS];
 
@@ -279,17 +284,10 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     for (int i = tid; i < total_tokens; i += LWS) {
         float val = scores[row_offset + i];
         if (val > local_max) local_max = val;
-=======
-    float max_val = scores[row_offset];
-    for (int j = 1; j < total_tokens; j++) {
-        float v = scores[row_offset + j];
-        if (v > max_val) max_val = v;
->>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
     sdata[tid] = local_max;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-<<<<<<< HEAD
     // Tree Reduction (Max)
     for (int s = LWS / 2; s > 0; s >>= 1) {
         if (tid < s) {
@@ -298,17 +296,9 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-=======
-    float sum_exp = 0.0f;
-    for (int j = 0; j < total_tokens; j++) {
-        float ev = exp(scores[row_offset + j] - max_val);
-        scores[row_offset + j] = ev;
-        sum_exp += ev;
->>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
     float row_max = sdata[0]; // 해당 Row의 최대값 확정
 
-<<<<<<< HEAD
     // -------------------------------------------------------
     // 2. Parallel Exp & Sum Calculation
     // -------------------------------------------------------
@@ -343,13 +333,9 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     for (int i = tid; i < total_tokens; i += LWS) {
         // 이미 Exp 계산된 값을 읽어서 곱하기만 함
         scores[row_offset + i] *= inv_sum;
-=======
-    float inv_sum = 1.0f / sum_exp;
-    for (int j = 0; j < total_tokens; j++) {
-        scores[row_offset + j] *= inv_sum;
->>>>>>> a1bfeb97c715c1962a00e4325b1f5d090bc33fce
     }
 }
+
 
 // 9. Attention Value Calculation (Scores * V)
 // Global Size: (heads, tokens, head_dim)
