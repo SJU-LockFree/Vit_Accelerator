@@ -63,7 +63,7 @@ void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b
     clSetKernelArg(kernel, 6, sizeof(int), &num_tokens);
 }
 
-/* [ 수정 ] : 디바이스를 추가 인자로 받음 */
+
 void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_context context, cl_command_queue queue, cl_program program, cl_device_id device)
 {
@@ -173,8 +173,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             int img_idx = i;
 
             // (A) 이미지 복사 Host -> GPU
-            t0 = now_ms();
 
+            t0 = now_ms();
             // 1) float → half 변환 (host side)
             size_t img_elems = 3 * IMG_SIZE * IMG_SIZE;
             float* src = image[i].data;  // ImageData가 float* data 라고 가정

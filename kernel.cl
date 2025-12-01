@@ -34,6 +34,7 @@ __kernel void conv2d_kernel(__global const half* input,   // ← float → half
     // 커널 윈도우 순회 (16x16x3)
     for (int ic = 0; ic < IN_CHANS; ++ic) {
         for (int kh = 0; kh < PATCH_SIZE; ++kh) {
+            #pragma unroll
             for (int kw = 0; kw < PATCH_SIZE; ++kw) {
                 int ih = oh * PATCH_SIZE + kh;
                 int iw = ow * PATCH_SIZE + kw;
@@ -104,6 +105,7 @@ __kernel void layer_norm_kernel(__global const float* input,
     float sum = 0.0f;
     float sum_sq = 0.0f;
 
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int i = 0; i < EMBED_DIM; i++) {
         float v = input[offset + i];
         sum += v;
@@ -115,6 +117,7 @@ __kernel void layer_norm_kernel(__global const float* input,
     float invstd = 1.0f / sqrt(var + EPS);
 
     // 2) 정규화 + scale(gamma) + shift(beta)
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int i = 0; i < EMBED_DIM; i++) {
         float x = input[offset + i];
         float gamma = weight[i]; // 차원별
@@ -158,6 +161,7 @@ __kernel void linear_kernel(__global const float* input,
     // K 방향(in_features)으로 몇 개의 타일이 필요한지
     int num_tiles = (in_features + TSz - 1) / TSz;
 
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int t = 0; t < num_tiles; ++t) {
         int k_base = t * TSz;
 
@@ -230,6 +234,7 @@ __kernel void attn_score_kernel(__global const float* qkv,
     int stride = 3 * EMBED_DIM;
 
     float score = 0.0f;
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int d = 0; d < HEAD_DIM; d++) {
         // Q: offset 0 ~ EMBED_DIM-1
         int q_idx = i * stride + (h * HEAD_DIM + d);
@@ -258,12 +263,14 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     int row_offset = (h * total_tokens + i) * total_tokens;
 
     float max_val = scores[row_offset];
+    #pragma unroll                               /* [ unloop 적용 ] */
     for (int j = 1; j < total_tokens; j++) {
         float v = scores[row_offset + j];
         if (v > max_val) max_val = v;
     }
 
     float sum_exp = 0.0f;
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int j = 0; j < total_tokens; j++) {
         float ev = exp(scores[row_offset + j] - max_val);
         scores[row_offset + j] = ev;
@@ -271,6 +278,7 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     }
 
     float inv_sum = 1.0f / sum_exp;
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int j = 0; j < total_tokens; j++) {
         scores[row_offset + j] *= inv_sum;
     }
@@ -293,6 +301,7 @@ __kernel void attn_value_kernel(__global const float* scores,
     int stride = 3 * EMBED_DIM;
 
     float sum = 0.0f;
+    #pragma unroll                                 /* [ unloop 적용 ] */
     for (int j = 0; j < total_tokens; j++) {
         float s = scores[row_offset + j];
 
