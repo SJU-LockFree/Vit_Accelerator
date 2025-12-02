@@ -89,7 +89,7 @@ __kernel void prepare_input_kernel(__global const float* patch_tokens,
     final_tokens[idx] = val + pos_emb[idx];
 }
 
-// 3. Layer Normalization
+// 3. Layer Normalization               /* [ 벡터화 ] */
 // Global Size: (tokens) -> 197
 // 각 스레드가 1개의 토큰(768차원)을 담당하여 정규화 수행
 __kernel void layer_norm_kernel(__global const float* input,
@@ -103,29 +103,47 @@ __kernel void layer_norm_kernel(__global const float* input,
 
     int offset = t * EMBED_DIM;
 
-    // 1) mean, var 계산
-    float sum = 0.0f;
-    float sum_sq = 0.0f;
+    // 1. [준비] float 포인터를 float4 포인터로 변환 (Type Casting)
+    // 이제 배열 인덱스 1이 증가할 때마다 실제로는 float 4칸씩 이동합니다.
+    __global const float4* in_vec = (__global const float4*)(input + offset);
+    __global float4* out_vec = (__global float4*)(output + offset);
+    __constant const float4* gamma_vec = (__constant const float4*)weight;
+    __constant const float4* beta_vec = (__constant const float4*)bias;
 
-    #pragma unroll                                 /* [ unloop 적용 ] */
-    for (int i = 0; i < EMBED_DIM; i++) {
-        float v = input[offset + i];
-        sum += v;
-        sum_sq += v * v;
+    // 2. [Mean, Var 계산] 벡터 루프
+    float4 v_sum = (float4)(0.0f);    // 4개 성분 0으로 초기화
+    float4 v_sum_sq = (float4)(0.0f);
+
+    // 루프 횟수가 1/4로 감소 (768 -> 192)
+    #pragma unroll 
+    for (int i = 0; i < EMBED_DIM / 4; i++) {
+        float4 val = in_vec[i];       // 4개 데이터 한 번에 로딩 (Load)
+        v_sum += val;                 // 4개 덧셈 동시 수행 (SIMD)
+        v_sum_sq += val * val;        // 4개 곱셈 -> 4개 덧셈
     }
+
+    // [벡터 -> 스칼라 리덕션]
+    // 4개로 쪼개져 있는 합계를 하나로 모음 (.x, .y, .z, .w)
+    float sum = v_sum.x + v_sum.y + v_sum.z + v_sum.w;
+    float sum_sq = v_sum_sq.x + v_sum_sq.y + v_sum_sq.z + v_sum_sq.w;
 
     float mean = sum / (float)EMBED_DIM;
     float var = sum_sq / (float)EMBED_DIM - mean * mean;
     float invstd = 1.0f / sqrt(var + EPS);
 
-    // 2) 정규화 + scale(gamma) + shift(beta)
-    #pragma unroll                                 /* [ unloop 적용 ] */
-    for (int i = 0; i < EMBED_DIM; i++) {
-        float x = input[offset + i];
-        float gamma = weight[i]; // 차원별
-        float beta = bias[i];
+    // 3. [정규화] 벡터 루프
+    #pragma unroll
+    for (int i = 0; i < EMBED_DIM / 4; i++) {
+        float4 val = in_vec[i];
+        float4 gamma = gamma_vec[i];
+        float4 beta = beta_vec[i];
 
-        output[offset + i] = (x - mean) * invstd * gamma + beta;
+        // 스칼라(mean, invstd)와 벡터(val)의 연산은
+        // OpenCL이 알아서 스칼라를 모든 벡터 성분에 적용(Broadcast)해줍니다.
+        // val(4개) - mean(1개) -> 각 성분에서 mean을 뺌
+        float4 res = (val - mean) * invstd * gamma + beta;
+
+        out_vec[i] = res; // 4개 데이터 한 번에 저장 (Store)
     }
 }
 
@@ -198,21 +216,21 @@ __kernel void linear_kernel(__global const float* input,
 }
 
 
-// 5. Add Residual (Element-wise add)
+// 5. Add Residual (Element-wise add)       /* [ 벡터화 ] */
 // Global Size: (total_elements)
-__kernel void add_kernel(__global const float* input,
-    __global float* output)
+__kernel void add_kernel(__global const float4* input,
+    __global float4* output)
 {
     int idx = get_global_id(0);
     output[idx] = output[idx] + input[idx];
 }
 
-// 6. GELU Activation
+// 6. GELU Activation                       /* [ 벡터화 ] */
 // Global Size: (total_elements)
-__kernel void gelu_kernel(__global float* data)
+__kernel void gelu_kernel(__global float4* data)
 {
     int idx = get_global_id(0);
-    float x = data[idx];
+    float4 x = data[idx];
     data[idx] = 0.5f * x * (1.0f + erf(x * 0.70710678f));
 }
 
@@ -233,20 +251,35 @@ __kernel void attn_score_kernel(__global const float* qkv,
     // 한 토큰당 3 * EMBED_DIM float
     int stride = 3 * EMBED_DIM;
 
-    float score = 0.0f;
-    #pragma unroll                                 /* [ unloop 적용 ] */
-    for (int d = 0; d < HEAD_DIM; d++) {
-        // Q: offset 0 ~ EMBED_DIM-1
-        int q_idx = i * stride + (h * HEAD_DIM + d);
+    // [1] 누적 변수를 float4 벡터로 선언 (0.0으로 초기화)
+    float4 score_vec = (float4)(0.0f);
 
-        // K: offset EMBED_DIM ~ 2*EMBED_DIM-1
-        int k_idx = j * stride + (EMBED_DIM + h * HEAD_DIM + d);
+    // [2] 루프를 4칸씩 점프하며 순회
+    // #pragma unroll을 사용해 루프 오버헤드를 더 줄일 수 있음
+    #pragma unroll 4
+    for (int d = 0; d < HEAD_DIM; d += 4) {
+        // Q Base Index
+        int q_base = i * stride + (h * HEAD_DIM + d);
 
-        score += qkv[q_idx] * qkv[k_idx];
+        // K Base Index
+        int k_base = j * stride + (EMBED_DIM + h * HEAD_DIM + d);
+
+        // [3] vload4: 메모리에서 float 4개를 한 번에 읽어옴
+        // &qkv[q_base] 주소부터 4개를 읽음
+        float4 vec_q = vload4(0, &qkv[q_base]);
+        float4 vec_k = vload4(0, &qkv[k_base]);
+
+        // [4] 벡터 곱셈 & 누적
+        // (x*x, y*y, z*z, w*w)가 동시에 계산되어 score_vec에 더해짐
+        score_vec += vec_q * vec_k;
     }
 
+    // [5] 수평 합산 (Horizontal Sum)
+    // 벡터의 4개 성분(x, y, z, w)을 모두 더해 최종 스칼라 값 생성
+    float final_score = score_vec.x + score_vec.y + score_vec.z + score_vec.w;
+
     scores[(h * total_tokens + i) * total_tokens + j] =
-        score / sqrt((float)HEAD_DIM);
+        final_score / sqrt((float)HEAD_DIM);
 }
 
 
@@ -292,25 +325,44 @@ __kernel void attn_value_kernel(__global const float* scores,
     int total_tokens)
 {
     int h = get_global_id(0); // head
-    int i = get_global_id(1); // query token
-    int d = get_global_id(2); // head dim
+    int i = get_global_id(1); // query token (output row)
+    int d_vec = get_global_id(2); // head dim / 4 (Vector index)
 
+    int d = d_vec * 4; // 실제 시작 인덱스 (0, 4, 8...)
+
+    // HEAD_DIM은 보통 64이므로 4의 배수라고 가정합니다.
     if (h >= NUM_HEADS || i >= total_tokens || d >= HEAD_DIM) return;
 
     int row_offset = (h * total_tokens + i) * total_tokens;
-    int stride = 3 * EMBED_DIM;
+    int stride = 3 * EMBED_DIM; // Q, K, V가 합쳐진 stride
 
-    float sum = 0.0f;
-    #pragma unroll                                 /* [ unloop 적용 ] */
+    // V 벡터의 시작 오프셋 (Q, K 다음)
+    // V starts at: 2 * EMBED_DIM + h * HEAD_DIM
+    int v_base_offset = 2 * EMBED_DIM + h * HEAD_DIM;
+
+    // 누적 합을 위한 float4 벡터 초기화
+    float4 sum_vec = (float4)(0.0f);
+
+    // [Loop Unrolling] 컴파일러에게 루프 최적화 지시
+#pragma unroll 4
     for (int j = 0; j < total_tokens; j++) {
+        // 1. Score는 스칼라 값 (Scalar Load)
+        // j번째 토큰에 대한 attention score (모든 d에 대해 동일)
         float s = scores[row_offset + j];
 
-        // V: offset 2*EMBED_DIM ~ 3*EMBED_DIM-1
-        int v_idx = j * stride + (2 * EMBED_DIM + h * HEAD_DIM + d);
+        // 2. V값은 4개를 한 번에 로딩 (Vector Load)
+        // 로딩 위치: j번째 토큰의 V 벡터 중 d번째 요소부터 4개
+        int v_idx = j * stride + v_base_offset + d;
+        float4 v_val = vload4(0, &qkv[v_idx]);
 
-        sum += s * qkv[v_idx];
+        // 3. 연산 (Scalar * Vector)
+        // s가 v_val의 x, y, z, w 성분에 각각 곱해짐
+        sum_vec += s * v_val;
     }
 
-    // 최종 [tokens, EMBED_DIM]로 저장
-    attn_output[i * EMBED_DIM + h * HEAD_DIM + d] = sum;
+    // 4. 최종 결과 저장 (Vector Store)
+    // [tokens, EMBED_DIM] 구조
+    // EMBED_DIM = NUM_HEADS * HEAD_DIM
+    int out_idx = i * EMBED_DIM + h * HEAD_DIM + d;
+    vstore4(sum_vec, 0, &attn_output[out_idx]);
 }
