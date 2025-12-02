@@ -94,8 +94,8 @@ __kernel void prepare_input_kernel(__global const float* patch_tokens,
 // 각 스레드가 1개의 토큰(768차원)을 담당하여 정규화 수행
 __kernel void layer_norm_kernel(__global const float* input,
     __global float* output,
-    __global const float* weight,
-    __global const float* bias)
+    __constant const float* weight,     /* [ constant화 ] */
+    __constant const float* bias)       /* [ constant화 ] */
 {
     int t = get_global_id(0); // token index
     int total_tokens = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE) + 1;
@@ -130,15 +130,13 @@ __kernel void layer_norm_kernel(__global const float* input,
 }
 
 
-// 4. Linear Layer (Matrix Multiplication)
- //Global Size: (tokens, out_features)
 // 4. Linear Layer (Matrix Multiplication, Tiled)
 // Global Size: (tokens, out_features)
 // Local Size : (TS, TS)  // TS = 16
 __kernel void linear_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
-    __global const float* bias,
+    __constant const float* bias,    /* [ constant화 ] */
     int in_features,
     int out_features,
     int tokens)
