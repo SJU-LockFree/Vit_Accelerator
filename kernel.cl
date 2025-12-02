@@ -16,7 +16,7 @@
 __kernel void conv2d_kernel(__global const half* input,   // ← float → half
     __global float* output,
     __global const float* weight,
-    __global const float* bias)
+    __constant const float* bias)
 {
     int idx = get_global_id(0);
     int output_size = IMG_SIZE / PATCH_SIZE; // 14
