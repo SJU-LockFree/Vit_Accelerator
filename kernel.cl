@@ -129,16 +129,13 @@ __kernel void layer_norm_kernel(__global const float* input,
     }
 }
 
-
-// 4. Linear Layer (Matrix Multiplication)
- //Global Size: (tokens, out_features)
 // 4. Linear Layer (Matrix Multiplication, Tiled)
 // Global Size: (tokens, out_features)
 // Local Size : (TS, TS)  // TS = 16
 __kernel void linear_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
-    __global const float* bias,
+    __constant const float* bias,
     int in_features,
     int out_features,
     int tokens)
