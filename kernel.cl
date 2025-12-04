@@ -137,9 +137,11 @@ __kernel void linear_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
     __constant const float* bias,
+    __global const float* residual,
     int in_features,
     int out_features,
-    int tokens)
+    int tokens,
+    int add_residual)
 {
     int row = get_global_id(0);
     int col = get_global_id(1);
@@ -177,7 +179,11 @@ __kernel void linear_kernel(__global const float* input,
     }
 
     if (row < tokens && col < out_features) {
-        output[row * out_features + col] = sum + bias[col];
+        float val = sum + bias[col];
+        if (add_residual) {
+            val += residual[row * out_features + col];
+        }
+        output[row * out_features + col] = val;
     }
 }
 
