@@ -86,23 +86,15 @@ int main() {
     cl_program program = clCreateProgramWithSource(context, 1, (const char**)&kernel_source, NULL, &err);
     CHECK_ERROR(err);
 
-    const char* options = "-cl-fast-relaxed-math";
+    const char* options = "-cl-fast-relaxed-math -cl-mad-enable";
     err = clBuildProgram(program, 1, &device_id, options, NULL, NULL);
     if (err != CL_SUCCESS) {
         // 빌드 에러 로그 출력 (필수)
-        size_t log_size = 0;
-        clGetProgramBuildInfo(program, device_id,
-            CL_PROGRAM_BUILD_LOG,
-            0, NULL, &log_size);
-
-        char* log = (char*)malloc(log_size + 1);
-        clGetProgramBuildInfo(program, device_id,
-            CL_PROGRAM_BUILD_LOG,
-            log_size, log, NULL);
-        log[log_size] = '\0';
-
-        printf("Build Log:\n%s\n", log);
-        free(log);
+        char buffer[4096];
+        size_t len;
+        clGetProgramBuildInfo(program, device_id, CL_PROGRAM_BUILD_LOG, sizeof(buffer), buffer, &len);
+        printf("Build Log:\n%s\n", buffer);
+        free(kernel_source);
         exit(1);
     }
     free(kernel_source);
