@@ -195,45 +195,106 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
                 /* MHA */
-                // MHA - Linear 1
+                /*
+                // 1. Linear 1 (QKV Projection)
+                // 업그레이드된 linear_kernel 사용 (Padding+Unroll 적용됨)
                 set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
+
                 global_linear[0] = ((tokens + 15) / 16) * 16;
                 global_linear[1] = ((dim * 3 + 15) / 16) * 16;
+                // ★ 중요: 최적화된 커널에 맞춰 Local Size {16, 16} 명시
                 clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
-                // MHA - Score
+                // 2. Score Calculation
                 clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
                 clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores[stream_id]);
                 clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);
                 size_t gws_score[3] = { NUM_HEADS, tokens, tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_attn_score, 3, NULL, gws_score, NULL, 0, NULL, NULL);
 
-                // MHA - Softmax
+                // 3. Softmax
                 clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores[stream_id]);
                 clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
                 size_t gws_softmax[2] = { NUM_HEADS, tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_softmax, 2, NULL, gws_softmax, NULL, 0, NULL, NULL);
 
-                // MHA - Values
+                // 4. Values
                 clSetKernelArg(k_attn_val, 0, sizeof(cl_mem), &d_scores[stream_id]);
                 clSetKernelArg(k_attn_val, 1, sizeof(cl_mem), &d_intermediate[stream_id]);
                 clSetKernelArg(k_attn_val, 2, sizeof(cl_mem), &d_buf2[stream_id]);
                 clSetKernelArg(k_attn_val, 3, sizeof(int), &tokens);
                 size_t gws_val[3] = { NUM_HEADS, tokens, HEAD_DIM };
                 clEnqueueNDRangeKernel(queues[stream_id], k_attn_val, 3, NULL, gws_val, NULL, 0, NULL, NULL);
+                */
+                /* MHA - Optimized */
 
-                // MHA - Final Linear
-                set_linear_args(k_linear, d_buf2[stream_id], d_residual[stream_id], d_networks[net_idx + 4], d_networks[net_idx + 5], dim, dim, tokens);
+                // 1. Linear 1 (QKV Projection)
+                // 업그레이드된 linear_kernel 사용 (Padding+Unroll 적용됨)
+                set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 2], d_networks[net_idx + 3], dim, dim * 3, tokens);
+
                 global_linear[0] = ((tokens + 15) / 16) * 16;
-                global_linear[1] = ((dim + 15) / 16) * 16;
+                global_linear[1] = ((dim * 3 + 15) / 16) * 16;
+                // ★ 중요: 최적화된 커널에 맞춰 Local Size {16, 16} 명시
                 clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
-                // Add 1
-                clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
-                clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
-                size_t gws_add[1] = { tokens * dim };
-                clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+                // 2. Score Calculation (Optimized Tiled)
+                clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate[stream_id]); // QKV
+                clSetKernelArg(k_attn_score, 1, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_attn_score, 2, sizeof(int), &tokens);
 
+                // Global Size: [Tokens(j), Tokens(i), Heads(h)]
+                // Padding to multiple of 16 for i and j
+                size_t global_score[3] = { ((tokens + 15) / 16) * 16, ((tokens + 15) / 16) * 16, NUM_HEADS };
+                size_t local_score[3] = { 16, 16, 1 }; // 16x16 Tiling
+
+                clEnqueueNDRangeKernel(queues[stream_id], k_attn_score, 3, NULL, global_score, local_score, 0, NULL, NULL);
+
+                // 3. Softmax
+                clSetKernelArg(k_softmax, 0, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_softmax, 1, sizeof(int), &tokens);
+                size_t gws_softmax[2] = { NUM_HEADS, tokens };
+                clEnqueueNDRangeKernel(queues[stream_id], k_softmax, 2, NULL, gws_softmax, NULL, 0, NULL, NULL);
+
+                // 4. Values Calculation (Optimized Tiled)
+                clSetKernelArg(k_attn_val, 0, sizeof(cl_mem), &d_scores[stream_id]);
+                clSetKernelArg(k_attn_val, 1, sizeof(cl_mem), &d_intermediate[stream_id]); // QKV
+                clSetKernelArg(k_attn_val, 2, sizeof(cl_mem), &d_buf2[stream_id]);         // Output
+                clSetKernelArg(k_attn_val, 3, sizeof(int), &tokens);
+
+                // Global Size: [HeadDim(d), Tokens(i), Heads(h)]
+                // Padding to multiple of 16 for d and i
+                size_t global_val[3] = { ((HEAD_DIM + 15) / 16) * 16, ((tokens + 15) / 16) * 16, NUM_HEADS };
+                size_t local_val[3] = { 16, 16, 1 }; // 16x16 Tiling
+
+                clEnqueueNDRangeKernel(queues[stream_id], k_attn_val, 3, NULL, global_val, local_val, 0, NULL, NULL);
+
+                // 5. Final Linear + Add Fused (커널 융합)
+                // linear_add_kernel을 재활용합니다.
+                // Input: d_buf2 (Attention Output)
+                // Output: d_buf1 (Accumulator) -> 결과가 여기에 바로 더해짐
+                // Prev_State: d_buf1 (기존 값, Skip Connection)
+
+                clSetKernelArg(k_linear_add, 0, sizeof(cl_mem), &d_buf2[stream_id]);        // Input
+                clSetKernelArg(k_linear_add, 1, sizeof(cl_mem), &d_residual[stream_id]);     // Output (d_residual에 임시 저장 후 add가 아님! -> 바로 d_buf1에 더하고 싶지만..)
+                // 잠시만요! 원본 로직을 보면:
+                // Final Linear -> d_residual 저장
+                // Add 1 -> d_residual + d_buf1 -> d_buf1 저장
+                // 따라서 k_linear_add를 쓸 때:
+                // Input: d_buf2, Output: d_buf1, Prev: d_buf1 으로 설정하면 완벽하게 융합됩니다.
+
+                clSetKernelArg(k_linear_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);         // Output (여기에 결과 저장)
+                clSetKernelArg(k_linear_add, 2, sizeof(cl_mem), &d_networks[net_idx + 4]);   // Weight
+                clSetKernelArg(k_linear_add, 3, sizeof(cl_mem), &d_networks[net_idx + 5]);   // Bias
+                clSetKernelArg(k_linear_add, 4, sizeof(int), &dim);
+                clSetKernelArg(k_linear_add, 5, sizeof(int), &dim);
+                clSetKernelArg(k_linear_add, 6, sizeof(int), &tokens);
+                clSetKernelArg(k_linear_add, 7, sizeof(cl_mem), &d_buf1[stream_id]);         // Prev State (더해질 대상)
+
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((dim + 15) / 16) * 16;
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear_add, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+                // (주의) 기존의 Add 1 커널 호출은 삭제합니다.
 
                 /* LN 2 */ 
                 clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1[stream_id]);
@@ -242,31 +303,6 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 7]);
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
 
-
-                /* MLP */
-                /*
-                // MLP - FC1
-                set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
-                global_linear[0] = ((tokens + 15) / 16) * 16;
-                global_linear[1] = ((hidden_dim + 15) / 16) * 16;
-                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-                // MLP - GELU
-                clSetKernelArg(k_gelu, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
-                size_t gws_gelu[1] = { tokens * hidden_dim };
-                clEnqueueNDRangeKernel(queues[stream_id], k_gelu, 1, NULL, gws_gelu, NULL, 0, NULL, NULL);
-
-                // MLP - FC2
-                set_linear_args(k_linear, d_intermediate[stream_id], d_residual[stream_id], d_networks[net_idx + 10], d_networks[net_idx + 11], hidden_dim, dim, tokens);
-                global_linear[0] = ((tokens + 15) / 16) * 16;
-                global_linear[1] = ((dim + 15) / 16) * 16;
-                clEnqueueNDRangeKernel(queues[stream_id], k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
-
-                // Add 2
-                clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
-                clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
-                clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
-                */
 
                 /* MLP - Optimized Tiled Kernels */
 
