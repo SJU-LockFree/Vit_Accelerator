@@ -23,7 +23,7 @@ double t_final_ln = 0.0;
 double t_head = 0.0;
 double t_read = 0.0;
 double t_softmax = 0.0;
-double t0, t1;
+double t0, t1, ts, te;
 
 static double now_ms(void) {
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
@@ -192,7 +192,6 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 1]);
                 size_t gws_ln[1] = { tokens };
                 clEnqueueNDRangeKernel(queues[stream_id], k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
-
 
                 /* MHA */
                 // MHA - Linear 1

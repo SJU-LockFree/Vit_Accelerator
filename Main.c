@@ -86,7 +86,7 @@ int main() {
     cl_program program = clCreateProgramWithSource(context, 1, (const char**)&kernel_source, NULL, &err);
     CHECK_ERROR(err);
 
-    const char* options = "-cl-fast-relaxed-math";
+    const char* options = "-cl-fast-relaxed-math -cl-mad-enable";
     err = clBuildProgram(program, 1, &device_id, options, NULL, NULL);
     if (err != CL_SUCCESS) {
         // 빌드 에러 로그 출력 (필수)
