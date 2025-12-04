@@ -9,47 +9,85 @@
 #define EPS 1e-6f
 #define TS 16
 
-// 1. Patch Embedding (Conv2d)
+
+// 1. Patch Embedding (Conv2d) - Vectorized Optimization
 // Global Size: (total_patches * embed_dim) -> (196 * 768)
 __kernel void conv2d_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
-    __global const float* bias)
+    __constant const float* bias)
 {
     int idx = get_global_id(0);
     int output_size = IMG_SIZE / PATCH_SIZE; // 14
     int total_patches = output_size * output_size; // 196
 
+    // 범위 체크
     if (idx >= total_patches * EMBED_DIM) return;
 
-    int oc = idx / total_patches;       // Output Channel (Embed Dim)
-    int patch_idx = idx % total_patches;
-    int oh = patch_idx / output_size;   // Patch Row
-    int ow = patch_idx % output_size;   // Patch Col
+    // 인덱스 분해
+    int oc = idx / total_patches;         // Output Channel (Filter Index)
+    int patch_idx = idx % total_patches;  // Patch Index (Spatial Index)
 
+    // 현재 처리할 패치의 이미지 상 좌표 (좌상단)
+    int oh = patch_idx / output_size;     // Patch Row
+    int ow = patch_idx % output_size;     // Patch Col
+
+    int start_y = oh * PATCH_SIZE;
+    int start_x = ow * PATCH_SIZE;
+
+    // Bias 로드
     float sum = bias[oc];
 
-    // 커널 윈도우 순회 (16x16x3)
-#pragma unroll
+    // Weight 오프셋 미리 계산 (Out Channel 차원 이동)
+    // Weight Shape: [Out_Ch, In_Ch, KH, KW]
+    int weight_oc_offset = oc * IN_CHANS * PATCH_SIZE * PATCH_SIZE;
+
+    // Loop Unrolling: 입력 채널(3)은 반복 횟수가 적으므로 루프 오버헤드 최소화
+#pragma unroll 
     for (int ic = 0; ic < IN_CHANS; ++ic) {
-#pragma unroll
+
+        // Input Image Offset (Channel 차원 이동)
+        // Input Shape: [In_Ch, Height, Width]
+        int input_ic_offset = ic * IMG_SIZE * IMG_SIZE;
+
+        // Weight Offset (Input Channel 차원 이동)
+        int weight_ic_offset = weight_oc_offset + (ic * PATCH_SIZE * PATCH_SIZE);
+
+        // 커널 높이(16) 반복
+#pragma unroll 
         for (int kh = 0; kh < PATCH_SIZE; ++kh) {
-#pragma unroll
-            for (int kw = 0; kw < PATCH_SIZE; ++kw) {
-                int ih = oh * PATCH_SIZE + kh;
-                int iw = ow * PATCH_SIZE + kw;
 
-                int input_idx = (ic * IMG_SIZE + ih) * IMG_SIZE + iw;
-                int kernel_idx = ((oc * IN_CHANS + ic) * PATCH_SIZE + kh) * PATCH_SIZE + kw;
+            // 현재 행(Row)의 시작 포인터 계산
+            int input_row_idx = input_ic_offset + (start_y + kh) * IMG_SIZE + start_x;
+            int weight_row_idx = weight_ic_offset + kh * PATCH_SIZE;
 
-                sum += input[input_idx] * weight[kernel_idx];
-            }
+            // ★ 핵심 최적화: 가로 16픽셀을 float4 x 4번으로 처리 ★
+            // PATCH_SIZE(16) / 4 = 4 iterations
+            // float4를 사용하면 128비트(16바이트)씩 한 번에 읽어옵니다.
+
+            // Vector 0 (pixels 0~3)
+            float4 in_val = vload4(0, &input[input_row_idx]);
+            float4 w_val = vload4(0, &weight[weight_row_idx]);
+            sum += dot(in_val, w_val);
+
+            // Vector 1 (pixels 4~7)
+            in_val = vload4(1, &input[input_row_idx]); // 오프셋 1 = 4 floats
+            w_val = vload4(1, &weight[weight_row_idx]);
+            sum += dot(in_val, w_val);
+
+            // Vector 2 (pixels 8~11)
+            in_val = vload4(2, &input[input_row_idx]);
+            w_val = vload4(2, &weight[weight_row_idx]);
+            sum += dot(in_val, w_val);
+
+            // Vector 3 (pixels 12~15)
+            in_val = vload4(3, &input[input_row_idx]);
+            w_val = vload4(3, &weight[weight_row_idx]);
+            sum += dot(in_val, w_val);
         }
     }
 
-    // ViT는 Flatten & Transpose를 하므로, (Patch, Channel) 순서로 저장해야 함
-    // 원본 코드의 flatten_transpose 역할을 여기서 미리 수행
-    // Output Index: patch_idx * EMBED_DIM + oc
+    // 결과 저장 (Flatten & Transpose: Patch -> Channel 순서)
     output[patch_idx * EMBED_DIM + oc] = sum;
 }
 
@@ -359,4 +397,127 @@ __kernel void attn_value_kernel(__global const float* scores,
     // EMBED_DIM = NUM_HEADS * HEAD_DIM
     int out_idx = i * EMBED_DIM + h * HEAD_DIM + d;
     vstore4(sum_vec, 0, &attn_output[out_idx]);
+}
+
+// [Optimized Tiled Kernel 1] Linear + GELU
+// 1. Tiling (Local Memory) 복구
+// 2. Memory Padding [16][17] 적용 -> Bank Conflict 제거
+// 3. Loop Unrolling 적용
+__kernel void linear_gelu_kernel(__global const float* input,
+    __global float* output,
+    __global const float* weight,
+    __constant const float* bias,
+    int in_features,
+    int out_features,
+    int tokens)
+{
+    // 인덱스
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    int local_row = get_local_id(0);
+    int local_col = get_local_id(1);
+
+    const int TSz = 16;
+
+    // ★ 핵심 최적화: Padding 적용 [16][17] ★
+    // 열(Column)을 하나 늘려 메모리 충돌 방지
+    __local float As[16][17];
+    __local float Bs[16][17];
+
+    float sum = 0.0f;
+    int num_tiles = (in_features + TSz - 1) / TSz;
+
+    for (int t = 0; t < num_tiles; ++t) {
+        int k_base = t * TSz;
+        int a_col = k_base + local_col;
+        int b_row = k_base + local_row;
+
+        // Load Global -> Local
+        if (row < tokens && a_col < in_features)
+            As[local_row][local_col] = input[row * in_features + a_col];
+        else
+            As[local_row][local_col] = 0.0f;
+
+        if (col < out_features && b_row < in_features)
+            Bs[local_row][local_col] = weight[col * in_features + b_row];
+        else
+            Bs[local_row][local_col] = 0.0f;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Compute
+        // ★ 핵심 최적화: Loop Unrolling ★
+        // 16번의 반복을 컴파일러가 최적화하도록 지시
+#pragma unroll
+        for (int k = 0; k < TSz; ++k) {
+            sum += As[local_row][k] * Bs[k][local_col];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // Result + GELU
+    if (row < tokens && col < out_features) {
+        float val = sum + bias[col];
+        // GELU
+        output[row * out_features + col] = 0.5f * val * (1.0f + erf(val * 0.70710678f));
+    }
+}
+
+// [Optimized Tiled Kernel 2] Linear + Add
+__kernel void linear_add_kernel(__global const float* input,
+    __global float* output,
+    __global const float* weight,
+    __constant const float* bias,
+    int in_features,
+    int out_features,
+    int tokens,
+    __global const float* prev_state) // Skip Connection
+{
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    int local_row = get_local_id(0);
+    int local_col = get_local_id(1);
+
+    const int TSz = 16;
+
+    // ★ Padding [16][17]
+    __local float As[16][17];
+    __local float Bs[16][17];
+
+    float sum = 0.0f;
+    int num_tiles = (in_features + TSz - 1) / TSz;
+
+    for (int t = 0; t < num_tiles; ++t) {
+        int k_base = t * TSz;
+        int a_col = k_base + local_col;
+        int b_row = k_base + local_row;
+
+        if (row < tokens && a_col < in_features)
+            As[local_row][local_col] = input[row * in_features + a_col];
+        else
+            As[local_row][local_col] = 0.0f;
+
+        if (col < out_features && b_row < in_features)
+            Bs[local_row][local_col] = weight[col * in_features + b_row];
+        else
+            Bs[local_row][local_col] = 0.0f;
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // Compute
+#pragma unroll
+        for (int k = 0; k < TSz; ++k) {
+            sum += As[local_row][k] * Bs[k][local_col];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // Result + Add
+    if (row < tokens && col < out_features) {
+        float val = sum + bias[col];
+        // Add Residual
+        output[row * out_features + col] = val + prev_state[row * out_features + col];
+    }
 }

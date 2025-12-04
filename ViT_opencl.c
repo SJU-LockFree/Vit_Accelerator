@@ -69,7 +69,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_attn_score = clCreateKernel(program, "attn_score_kernel", &err);
     cl_kernel k_softmax = clCreateKernel(program, "softmax_kernel", &err);
     cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);    
-
+    cl_kernel k_linear_gelu = clCreateKernel(program, "linear_gelu_kernel", &err);
+    cl_kernel k_linear_add = clCreateKernel(program, "linear_add_kernel", &err);
 
     // 2. 버퍼 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -243,6 +244,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
 
                 /* MLP */
+                /*
                 // MLP - FC1
                 set_linear_args(k_linear, d_buf2[stream_id], d_intermediate[stream_id], d_networks[net_idx + 8], d_networks[net_idx + 9], dim, hidden_dim, tokens);
                 global_linear[0] = ((tokens + 15) / 16) * 16;
@@ -264,6 +266,37 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
                 clSetKernelArg(k_add, 0, sizeof(cl_mem), &d_residual[stream_id]);
                 clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
                 clEnqueueNDRangeKernel(queues[stream_id], k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+                */
+
+                /* MLP - Optimized Tiled Kernels */
+
+                // 1. FC1 + GELU
+                set_linear_args(k_linear_gelu, d_buf2[stream_id], d_intermediate[stream_id],
+                    d_networks[net_idx + 8], d_networks[net_idx + 9],
+                    dim, hidden_dim, tokens);
+
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((hidden_dim + 15) / 16) * 16;
+
+                // ★ 중요: Local Size를 {16, 16}으로 복구
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear_gelu, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+
+
+                // 2. FC2 + Add
+                clSetKernelArg(k_linear_add, 0, sizeof(cl_mem), &d_intermediate[stream_id]);
+                clSetKernelArg(k_linear_add, 1, sizeof(cl_mem), &d_buf1[stream_id]);
+                clSetKernelArg(k_linear_add, 2, sizeof(cl_mem), &d_networks[net_idx + 10]);
+                clSetKernelArg(k_linear_add, 3, sizeof(cl_mem), &d_networks[net_idx + 11]);
+                clSetKernelArg(k_linear_add, 4, sizeof(int), &hidden_dim);
+                clSetKernelArg(k_linear_add, 5, sizeof(int), &dim);
+                clSetKernelArg(k_linear_add, 6, sizeof(int), &tokens);
+                clSetKernelArg(k_linear_add, 7, sizeof(cl_mem), &d_buf1[stream_id]);
+
+                global_linear[0] = ((tokens + 15) / 16) * 16;
+                global_linear[1] = ((dim + 15) / 16) * 16;
+
+                // ★ 중요: Local Size를 {16, 16}으로 복구
+                clEnqueueNDRangeKernel(queues[stream_id], k_linear_add, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
 
                 net_idx += 12;
             }
@@ -338,5 +371,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     clReleaseKernel(k_gelu);
     clReleaseKernel(k_attn_score);
     clReleaseKernel(k_softmax);
-    clReleaseKernel(k_attn_val);
+    clReleaseKernel(k_attn_val); 
+    clReleaseKernel(k_linear_gelu);
+    clReleaseKernel(k_linear_add);
 }
