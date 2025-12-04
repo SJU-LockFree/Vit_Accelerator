@@ -312,3 +312,85 @@ __kernel void gather_cls_kernel(__global const float* input_tokens,
 
     output_cls_vec[idx] = input_tokens[input_idx];
 }
+
+#define LNQKV_WG_SIZE 64
+
+__kernel void ln_qkv_fused_kernel(__global const float* input,
+    __global float* qkv_out,
+    __constant const float* gamma,
+    __constant const float* beta,
+    __global const float* weight,
+    __constant const float* bias,
+    int tokens)
+{
+    int token = get_group_id(0);     // 몇 번째 토큰인지 (row index)
+    int lid = get_local_id(0);     // 워크그룹 내 로컬 ID
+    int lsize = get_local_size(0);   // 워크그룹 크기
+
+    if (token >= tokens) return;
+
+    __local float x[EMBED_DIM];
+    __local float norm[EMBED_DIM];
+    __local float partial_sum[LNQKV_WG_SIZE];
+    __local float partial_sq[LNQKV_WG_SIZE];
+    __local float mean_var[2];
+
+    // 1) 입력 토큰 로컬 메모리에 로드
+    for (int d = lid; d < EMBED_DIM; d += lsize) {
+        x[d] = input[token * EMBED_DIM + d];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 2) mean/var 계산용 partial sum
+    float s = 0.0f;
+    float s2 = 0.0f;
+    for (int d = lid; d < EMBED_DIM; d += lsize) {
+        float v = x[d];
+        s += v;
+        s2 += v * v;
+    }
+    partial_sum[lid] = s;
+    partial_sq[lid] = s2;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (lid == 0) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int i = 0; i < lsize; i++) {
+            sum += partial_sum[i];
+            sum_sq += partial_sq[i];
+        }
+        float mean = sum / (float)EMBED_DIM;
+        float var = sum_sq / (float)EMBED_DIM - mean * mean;
+        float invstd = 1.0f / sqrt(var + EPS);
+        mean_var[0] = mean;
+        mean_var[1] = invstd;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float mean = mean_var[0];
+    float invstd = mean_var[1];
+
+    // 3) LayerNorm: norm[d] = (x-mean)/std * gamma + beta
+    for (int d = lid; d < EMBED_DIM; d += lsize) {
+        float v = x[d];
+        float g = gamma[d];
+        float b = beta[d];
+        norm[d] = (v - mean) * invstd * g + b;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4) QKV Linear: [tokens, EMBED_DIM] * [3*EMBED_DIM, EMBED_DIM]^T
+    int out_features = 3 * EMBED_DIM;
+
+    for (int col = lid; col < out_features; col += lsize) {
+        float acc = bias[col];
+        int w_base = col * EMBED_DIM;
+
+        for (int d = 0; d < EMBED_DIM; ++d) {
+            acc += norm[d] * weight[w_base + d];
+        }
+
+        qkv_out[token * out_features + col] = acc;
+    }
+}

@@ -18,6 +18,7 @@
 
 // [변경] 배치 사이즈 정의
 #define BATCH_SIZE 32
+#define LNQKV_WG_SIZE 64
 
 // Helper: Linear Args 설정
 void set_linear_args(cl_kernel kernel, cl_mem in, cl_mem out, cl_mem w, cl_mem b, int in_f, int out_f, int total_tokens) {
@@ -47,6 +48,7 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     cl_kernel k_attn_val = clCreateKernel(program, "attn_value_kernel", &err);
     // [추가] CLS 토큰을 모으는 커널
     cl_kernel k_gather = clCreateKernel(program, "gather_cls_kernel", &err);
+    cl_kernel k_ln_qkv = clCreateKernel(program, "ln_qkv_fused_kernel", &err);
 
     // 2. 크기 계산
     int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE); // 196
@@ -124,20 +126,24 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
         int tokens_in_pass = tokens_per_img * current_batch;
 
         for (int l = 0; l < 12; l++) {
-            // LN 1
-            clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);
-            clSetKernelArg(k_ln, 1, sizeof(cl_mem), &d_buf2);
-            clSetKernelArg(k_ln, 2, sizeof(cl_mem), &d_networks[net_idx + 0]);
-            clSetKernelArg(k_ln, 3, sizeof(cl_mem), &d_networks[net_idx + 1]);
-            size_t gws_ln[1] = { (size_t)tokens_in_pass };
-            clEnqueueNDRangeKernel(queue, k_ln, 1, NULL, gws_ln, NULL, 0, NULL, NULL);
+            // === LN1 + QKV Fused ===
+            // 입력: d_buf1  (블록 입력 토큰들)
+            // 출력: d_intermediate  (QKV 결과, 기존이랑 동일한 버퍼)
+            clSetKernelArg(k_ln_qkv, 0, sizeof(cl_mem), &d_buf1);
+            clSetKernelArg(k_ln_qkv, 1, sizeof(cl_mem), &d_intermediate);
+            clSetKernelArg(k_ln_qkv, 2, sizeof(cl_mem), &d_networks[net_idx + 0]); // LN1 gamma
+            clSetKernelArg(k_ln_qkv, 3, sizeof(cl_mem), &d_networks[net_idx + 1]); // LN1 beta
+            clSetKernelArg(k_ln_qkv, 4, sizeof(cl_mem), &d_networks[net_idx + 2]); // QKV weight
+            clSetKernelArg(k_ln_qkv, 5, sizeof(cl_mem), &d_networks[net_idx + 3]); // QKV bias
+            clSetKernelArg(k_ln_qkv, 6, sizeof(int), &tokens_in_pass);
 
-            // MHA - Linear 1 (QKV)
-            set_linear_args(k_linear, d_buf2, d_intermediate, d_networks[net_idx + 2], d_networks[net_idx + 3],
-                dim, dim * 3, tokens_in_pass);
-            global_linear[0] = ((tokens_in_pass + 15) / 16) * 16;
-            global_linear[1] = ((dim * 3 + 15) / 16) * 16;
-            clEnqueueNDRangeKernel(queue, k_linear, 2, NULL, global_linear, local_linear, 0, NULL, NULL);
+            // 워크그룹: 토큰 하나당 LNQKV_WG_SIZE 스레드
+            size_t local_lnq[1] = { LNQKV_WG_SIZE };
+            size_t global_lnq[1] = { (size_t)tokens_in_pass * LNQKV_WG_SIZE };
+
+            clEnqueueNDRangeKernel(queue, k_ln_qkv, 1, NULL,
+                global_lnq, local_lnq,
+                0, NULL, NULL);
 
             // MHA - Score
             clSetKernelArg(k_attn_score, 0, sizeof(cl_mem), &d_intermediate);
@@ -172,6 +178,8 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
             clSetKernelArg(k_add, 1, sizeof(cl_mem), &d_buf1);
             size_t gws_add[1] = { (size_t)tokens_in_pass * dim };
             clEnqueueNDRangeKernel(queue, k_add, 1, NULL, gws_add, NULL, 0, NULL, NULL);
+
+            size_t gws_ln[1] = { (size_t)tokens_in_pass };
 
             // LN 2
             clSetKernelArg(k_ln, 0, sizeof(cl_mem), &d_buf1);                 // 입력: Add1 결과
@@ -284,4 +292,5 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
     clReleaseKernel(k_softmax);
     clReleaseKernel(k_attn_val);
     clReleaseKernel(k_gather); // [추가]
+    clReleaseKernel(k_ln_qkv);
 }
