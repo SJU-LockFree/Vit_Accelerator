@@ -130,53 +130,73 @@ __kernel void layer_norm_kernel(__global const float* input,
     __constant const float* weight,     /* [ constant화 ] */
     __constant const float* bias)       /* [ constant화 ] */
 {
-    int t = get_global_id(0); // token index
-    int total_tokens = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE) + 1;
-    if (t >= total_tokens) return;
+    // 256 threads work together for one token
+    int tid = get_local_id(0);       // 0 ~ 255
+    int token_id = get_group_id(0);  // 0 ~ 196
 
-    int offset = t * EMBED_DIM;
+    // EMBED_DIM = 768
+    // 768 / 4 = 192 iterations needed for float4
+    // Local Size 256 is enough to cover 192.
 
-    // 1. [준비] float 포인터를 float4 포인터로 변환 (Type Casting)
-    // 이제 배열 인덱스 1이 증가할 때마다 실제로는 float 4칸씩 이동합니다.
-    __global const float4* in_vec = (__global const float4*)(input + offset);
-    __global float4* out_vec = (__global float4*)(output + offset);
-    __constant const float4* gamma_vec = (__constant const float4*)weight;
-    __constant const float4* beta_vec = (__constant const float4*)bias;
+    // Shared Memory for Reduction
+    __local float s_sum[256];
+    __local float s_sq[256];
+    __local float s_mean;
+    __local float s_invstd;
 
-    // 2. [Mean, Var 계산] 벡터 루프
-    float4 v_sum = (float4)(0.0f);    // 4개 성분 0으로 초기화
-    float4 v_sum_sq = (float4)(0.0f);
+    // 1. Load Data & Calculate Partial Sums
+    float4 val = (float4)(0.0f);
+    float my_sum = 0.0f;
+    float my_sq = 0.0f;
 
-    // 루프 횟수가 1/4로 감소 (768 -> 192)
-#pragma unroll 
-    for (int i = 0; i < EMBED_DIM / 4; i++) {
-        float4 val = in_vec[i];       // 4개 데이터 한 번에 로딩 (Load)
-        v_sum += val;                 // 4개 덧셈 동시 수행 (SIMD)
-        v_sum_sq += val * val;        // 4개 곱셈 -> 4개 덧셈
+    // Only threads 0~191 need to load data
+    if (tid < 192) {
+        int offset = token_id * EMBED_DIM + tid * 4;
+        val = vload4(0, &input[offset]);
+
+        // Sum components
+        my_sum = val.x + val.y + val.z + val.w;
+        // Sum squares
+        my_sq = val.x * val.x + val.y * val.y + val.z * val.z + val.w * val.w;
     }
 
-    // [벡터 -> 스칼라 리덕션]
-    // 4개로 쪼개져 있는 합계를 하나로 모음 (.x, .y, .z, .w)
-    float sum = v_sum.x + v_sum.y + v_sum.z + v_sum.w;
-    float sum_sq = v_sum_sq.x + v_sum_sq.y + v_sum_sq.z + v_sum_sq.w;
+    s_sum[tid] = my_sum;
+    s_sq[tid] = my_sq;
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    float mean = sum / (float)EMBED_DIM;
-    float var = sum_sq / (float)EMBED_DIM - mean * mean;
-    float invstd = 1.0f / sqrt(var + EPS);
-
-    // 3. [정규화] 벡터 루프
+    // 2. Parallel Reduction (Tree-based)
+    // 256 -> 128 -> 64 -> ... -> 1
 #pragma unroll
-    for (int i = 0; i < EMBED_DIM / 4; i++) {
-        float4 val = in_vec[i];
-        float4 gamma = gamma_vec[i];
-        float4 beta = beta_vec[i];
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_sum[tid] += s_sum[tid + s];
+            s_sq[tid] += s_sq[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
 
-        // 스칼라(mean, invstd)와 벡터(val)의 연산은
-        // OpenCL이 알아서 스칼라를 모든 벡터 성분에 적용(Broadcast)해줍니다.
-        // val(4개) - mean(1개) -> 각 성분에서 mean을 뺌
-        float4 res = (val - mean) * invstd * gamma + beta;
+    // 3. Calculate Mean & Var (Thread 0 only)
+    if (tid == 0) {
+        float total_sum = s_sum[0];
+        float total_sq = s_sq[0];
 
-        out_vec[i] = res; // 4개 데이터 한 번에 저장 (Store)
+        s_mean = total_sum / (float)EMBED_DIM;
+        float var = total_sq / (float)EMBED_DIM - s_mean * s_mean;
+        s_invstd = 1.0f / sqrt(var + EPS);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4. Normalize & Store
+    if (tid < 192) {
+        // Load Gamma/Beta (Weight/Bias)
+        float4 gamma = vload4(tid, weight);
+        float4 beta = vload4(tid, bias);
+
+        // Broadcast mean/invstd
+        float4 res = (val - s_mean) * s_invstd * gamma + beta;
+
+        int offset = token_id * EMBED_DIM + tid * 4;
+        vstore4(res, 0, &output[offset]);
     }
 }
 
@@ -411,51 +431,7 @@ __kernel void attn_value_kernel(__global const float* scores,
         attn_output[out_idx] = sum;
     }
 }
-/*
-__kernel void attn_score_kernel(__global const float* qkv,
-    __global float* scores,
-    int total_tokens)
-{
-    int h = get_global_id(0); // head
-    int i = get_global_id(1); // query token
-    int j = get_global_id(2); // key token
 
-    if (h >= NUM_HEADS || i >= total_tokens || j >= total_tokens) return;
-
-    // 한 토큰당 3 * EMBED_DIM float
-    int stride = 3 * EMBED_DIM;
-
-    // [1] 누적 변수를 float4 벡터로 선언 (0.0으로 초기화)
-    float4 score_vec = (float4)(0.0f);
-
-    // [2] 루프를 4칸씩 점프하며 순회
-    // #pragma unroll을 사용해 루프 오버헤드를 더 줄일 수 있음
-#pragma unroll 4
-    for (int d = 0; d < HEAD_DIM; d += 4) {
-        // Q Base Index
-        int q_base = i * stride + (h * HEAD_DIM + d);
-
-        // K Base Index
-        int k_base = j * stride + (EMBED_DIM + h * HEAD_DIM + d);
-
-        // [3] vload4: 메모리에서 float 4개를 한 번에 읽어옴
-        // &qkv[q_base] 주소부터 4개를 읽음
-        float4 vec_q = vload4(0, &qkv[q_base]);
-        float4 vec_k = vload4(0, &qkv[k_base]);
-
-        // [4] 벡터 곱셈 & 누적
-        // (x*x, y*y, z*z, w*w)가 동시에 계산되어 score_vec에 더해짐
-        score_vec += vec_q * vec_k;
-    }
-
-    // [5] 수평 합산 (Horizontal Sum)
-    // 벡터의 4개 성분(x, y, z, w)을 모두 더해 최종 스칼라 값 생성
-    float final_score = score_vec.x + score_vec.y + score_vec.z + score_vec.w;
-
-    scores[(h * total_tokens + i) * total_tokens + j] =
-        final_score / sqrt((float)HEAD_DIM);
-}
-*/
 
 
 // 8. Softmax (Applied per row in scores)
@@ -463,89 +439,78 @@ __kernel void attn_score_kernel(__global const float* qkv,
 // 각 스레드가 하나의 행(row)을 맡아서 Softmax 처리
 __kernel void softmax_kernel(__global float* scores, int total_tokens)
 {
-    int h = get_global_id(0);
-    int i = get_global_id(1);
+    int tid = get_local_id(0);
+    int group_id = get_group_id(0); // This represents unique row index
 
-    if (h >= NUM_HEADS || i >= total_tokens) return;
+    // Original Logic: row_offset = (h * tokens + i) * tokens
+    // We flattened the global execution. 
+    // group_id corresponds to (h * tokens + i)
 
-    int row_offset = (h * total_tokens + i) * total_tokens;
+    int row_offset = group_id * total_tokens;
 
-    // Max Find
-    float max_val = scores[row_offset];
-#pragma unroll
-    for (int j = 1; j < total_tokens; j++) {
-        float val = scores[row_offset + j];
-        if (val > max_val) max_val = val;
+    __local float s_data[256]; // Shared Mem
+    __local float s_max;
+    __local float s_sum;
+
+    // 1. Find Max (Parallel Reduction)
+    float my_val = -1e30f; // -Infinity
+
+    if (tid < total_tokens) {
+        my_val = scores[row_offset + tid];
+    }
+    s_data[tid] = my_val;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Tree Reduction for Max
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_data[tid + s] > s_data[tid]) {
+                s_data[tid] = s_data[tid + s];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (tid == 0) s_max = s_data[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 2. Calculate Exp & Sum (Parallel Reduction)
+    float my_exp = 0.0f;
+    if (tid < total_tokens) {
+        // Recalculate my_val or read from global? 
+        // Global read is safer as s_data was modified.
+        // Or simply: my_val is still in register if not spilled.
+        // Let's read strictly to be safe, or reuse logic.
+        // Actually we need to update global memory with exp values? 
+        // No, standard softmax writes normalized values at the end.
+        // Let's compute exp and store in local temporarily? 
+        // No, writing to global intermediate is fine.
+
+        float val = scores[row_offset + tid];
+        my_exp = exp(val - s_max);
+        scores[row_offset + tid] = my_exp; // Write exp temporarily
     }
 
-    // Exp & Sum
-    float sum_exp = 0.0f;
-#pragma unroll
-    for (int j = 0; j < total_tokens; j++) {
-        float val = exp(scores[row_offset + j] - max_val);
-        scores[row_offset + j] = val;
-        sum_exp += val;
-    }
+    s_data[tid] = my_exp;
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Normalize
-    float inv_sum = 1.0f / sum_exp;
-#pragma unroll
-    for (int j = 0; j < total_tokens; j++) {
-        scores[row_offset + j] *= inv_sum;
+    // Tree Reduction for Sum
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_data[tid] += s_data[tid + s];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (tid == 0) s_sum = s_data[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 3. Normalize
+    if (tid < total_tokens) {
+        float inv_sum = 1.0f / s_sum;
+        // Read the exp value we wrote earlier
+        scores[row_offset + tid] *= inv_sum;
     }
 }
 
-// 9. Attention Value Calculation (Scores * V)
-// Global Size: (heads, tokens, head_dim)
-/*
-__kernel void attn_value_kernel(__global const float* scores,
-    __global const float* qkv,
-    __global float* attn_output,
-    int total_tokens)
-{
-    int h = get_global_id(0); // head
-    int i = get_global_id(1); // query token (output row)
-    int d_vec = get_global_id(2); // head dim / 4 (Vector index)
-
-    int d = d_vec * 4; // 실제 시작 인덱스 (0, 4, 8...)
-
-    // HEAD_DIM은 보통 64이므로 4의 배수라고 가정합니다.
-    if (h >= NUM_HEADS || i >= total_tokens || d >= HEAD_DIM) return;
-
-    int row_offset = (h * total_tokens + i) * total_tokens;
-    int stride = 3 * EMBED_DIM; // Q, K, V가 합쳐진 stride
-
-    // V 벡터의 시작 오프셋 (Q, K 다음)
-    // V starts at: 2 * EMBED_DIM + h * HEAD_DIM
-    int v_base_offset = 2 * EMBED_DIM + h * HEAD_DIM;
-
-    // 누적 합을 위한 float4 벡터 초기화
-    float4 sum_vec = (float4)(0.0f);
-
-    // [Loop Unrolling] 컴파일러에게 루프 최적화 지시
-#pragma unroll 4
-    for (int j = 0; j < total_tokens; j++) {
-        // 1. Score는 스칼라 값 (Scalar Load)
-        // j번째 토큰에 대한 attention score (모든 d에 대해 동일)
-        float s = scores[row_offset + j];
-
-        // 2. V값은 4개를 한 번에 로딩 (Vector Load)
-        // 로딩 위치: j번째 토큰의 V 벡터 중 d번째 요소부터 4개
-        int v_idx = j * stride + v_base_offset + d;
-        float4 v_val = vload4(0, &qkv[v_idx]);
-
-        // 3. 연산 (Scalar * Vector)
-        // s가 v_val의 x, y, z, w 성분에 각각 곱해짐
-        sum_vec += s * v_val;
-    }
-
-    // 4. 최종 결과 저장 (Vector Store)
-    // [tokens, EMBED_DIM] 구조
-    // EMBED_DIM = NUM_HEADS * HEAD_DIM
-    int out_idx = i * EMBED_DIM + h * HEAD_DIM + d;
-    vstore4(sum_vec, 0, &attn_output[out_idx]);
-}
-*/
 
 // [Optimized Tiled Kernel 1] Linear + GELU
 // 1. Tiling (Local Memory) 복구
