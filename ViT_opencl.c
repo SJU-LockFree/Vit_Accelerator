@@ -360,12 +360,13 @@ void ViT_opencl(ImageData* image, cl_mem* d_networks, float** probabilities,
 
             double t_total = t_upload + t_patch_embed + t_encoder
                 + t_final_ln + t_head + t_read + t_softmax;
-
+            /*
             printf("[IMG %d] upload=%.3f ms, patch=%.3f ms, encoder=%.3f ms, "
                 "final_ln=%.3f ms, head=%.3f ms, read=%.3f ms, softmax=%.3f ms, total=%.3f ms\n",
                 img_idx,
                 t_upload, t_patch_embed, t_encoder,
                 t_final_ln, t_head, t_read, t_softmax, t_total);
+            */
         }
     }
 
