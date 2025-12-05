@@ -182,7 +182,7 @@ __kernel void layer_norm_kernel(__global const float* input,
 
         s_mean = total_sum / (float)EMBED_DIM;
         float var = total_sq / (float)EMBED_DIM - s_mean * s_mean;
-        s_invstd = 1.0f / sqrt(var + EPS);
+        s_invstd = native_recip(native_sqrt(var + EPS));
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -356,7 +356,7 @@ __kernel void attn_score_kernel(__global const float* qkv,
 
     if (h < NUM_HEADS && i < total_tokens && j < total_tokens) {
         int out_idx = (h * total_tokens + i) * total_tokens + j;
-        scores[out_idx] = sum / sqrt((float)HEAD_DIM);
+        scores[out_idx] = sum / native_sqrt((float)HEAD_DIM);
     }
 }
 
@@ -486,7 +486,7 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
         // No, writing to global intermediate is fine.
 
         float val = scores[row_offset + tid];
-        my_exp = exp(val - s_max);
+        my_exp = native_exp(val - s_max);
         scores[row_offset + tid] = my_exp; // Write exp temporarily
     }
 
@@ -505,7 +505,7 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
 
     // 3. Normalize
     if (tid < total_tokens) {
-        float inv_sum = 1.0f / s_sum;
+        float inv_sum = native_recip(s_sum);
         // Read the exp value we wrote earlier
         scores[row_offset + tid] *= inv_sum;
     }
