@@ -87,6 +87,7 @@ int main() {
     CHECK_ERROR(err);
 
     const char* options = "-cl-fast-relaxed-math -cl-mad-enable";
+    //const char* options = NULL;
     err = clBuildProgram(program, 1, &device_id, options, NULL, NULL);
     if (err != CL_SUCCESS) {
         // 빌드 에러 로그 출력 (필수)

@@ -15,112 +15,105 @@
 __kernel void conv2d_kernel(__global const float* input,
     __global float* output,
     __global const float* weight,
-    __constant const float* bias)
+    __constant const float* bias,
+    int batch_size)
 {
     int idx = get_global_id(0);
-    int output_size = IMG_SIZE / PATCH_SIZE; // 14
-    int total_patches = output_size * output_size; // 196
 
-    // 범위 체크
-    if (idx >= total_patches * EMBED_DIM) return;
+    int out_hw = IMG_SIZE / PATCH_SIZE;              // 14
+    int patches_per_img = out_hw * out_hw;                    // 196
+    int dims_per_img = patches_per_img * EMBED_DIM;        // 196 * 768
+    int total_elems = batch_size * dims_per_img;
 
-    // 인덱스 분해
-    int oc = idx / total_patches;         // Output Channel (Filter Index)
-    int patch_idx = idx % total_patches;  // Patch Index (Spatial Index)
+    if (idx >= total_elems) return;
 
-    // 현재 처리할 패치의 이미지 상 좌표 (좌상단)
-    int oh = patch_idx / output_size;     // Patch Row
-    int ow = patch_idx % output_size;     // Patch Col
+    int b = idx / dims_per_img;      // 배치 인덱스
+    int idx_in_img = idx % dims_per_img;
+
+    int oc = idx_in_img / patches_per_img;
+    int patch_idx = idx_in_img % patches_per_img;
+
+    int oh = patch_idx / out_hw;
+    int ow = patch_idx % out_hw;
 
     int start_y = oh * PATCH_SIZE;
     int start_x = ow * PATCH_SIZE;
 
-    // Bias 로드
-    float sum = bias[oc];
+    int input_batch_offset = b * (IN_CHANS * IMG_SIZE * IMG_SIZE);
 
-    // Weight 오프셋 미리 계산 (Out Channel 차원 이동)
-    // Weight Shape: [Out_Ch, In_Ch, KH, KW]
+    float sum = bias[oc];
     int weight_oc_offset = oc * IN_CHANS * PATCH_SIZE * PATCH_SIZE;
 
-    // Loop Unrolling: 입력 채널(3)은 반복 횟수가 적으므로 루프 오버헤드 최소화
-#pragma unroll 
     for (int ic = 0; ic < IN_CHANS; ++ic) {
+        int input_ic_offset = input_batch_offset + ic * IMG_SIZE * IMG_SIZE;
+        int weight_ic_offset = weight_oc_offset + ic * PATCH_SIZE * PATCH_SIZE;
 
-        // Input Image Offset (Channel 차원 이동)
-        // Input Shape: [In_Ch, Height, Width]
-        int input_ic_offset = ic * IMG_SIZE * IMG_SIZE;
-
-        // Weight Offset (Input Channel 차원 이동)
-        int weight_ic_offset = weight_oc_offset + (ic * PATCH_SIZE * PATCH_SIZE);
-
-        // 커널 높이(16) 반복
-#pragma unroll 
         for (int kh = 0; kh < PATCH_SIZE; ++kh) {
-
-            // 현재 행(Row)의 시작 포인터 계산
             int input_row_idx = input_ic_offset + (start_y + kh) * IMG_SIZE + start_x;
             int weight_row_idx = weight_ic_offset + kh * PATCH_SIZE;
 
-            // ★ 핵심 최적화: 가로 16픽셀을 float4 x 4번으로 처리 ★
-            // PATCH_SIZE(16) / 4 = 4 iterations
-            // float4를 사용하면 128비트(16바이트)씩 한 번에 읽어옵니다.
+            float4 in0 = vload4(0, &input[input_row_idx]);
+            float4 w0 = vload4(0, &weight[weight_row_idx]);
+            sum += dot(in0, w0);
 
-            // Vector 0 (pixels 0~3)
-            float4 in_val = vload4(0, &input[input_row_idx]);
-            float4 w_val = vload4(0, &weight[weight_row_idx]);
-            sum += dot(in_val, w_val);
+            float4 in1 = vload4(1, &input[input_row_idx]);
+            float4 w1 = vload4(1, &weight[weight_row_idx]);
+            sum += dot(in1, w1);
 
-            // Vector 1 (pixels 4~7)
-            in_val = vload4(1, &input[input_row_idx]); // 오프셋 1 = 4 floats
-            w_val = vload4(1, &weight[weight_row_idx]);
-            sum += dot(in_val, w_val);
+            float4 in2 = vload4(2, &input[input_row_idx]);
+            float4 w2 = vload4(2, &weight[weight_row_idx]);
+            sum += dot(in2, w2);
 
-            // Vector 2 (pixels 8~11)
-            in_val = vload4(2, &input[input_row_idx]);
-            w_val = vload4(2, &weight[weight_row_idx]);
-            sum += dot(in_val, w_val);
-
-            // Vector 3 (pixels 12~15)
-            in_val = vload4(3, &input[input_row_idx]);
-            w_val = vload4(3, &weight[weight_row_idx]);
-            sum += dot(in_val, w_val);
+            float4 in3 = vload4(3, &input[input_row_idx]);
+            float4 w3 = vload4(3, &weight[weight_row_idx]);
+            sum += dot(in3, w3);
         }
     }
 
-    // 결과 저장 (Flatten & Transpose: Patch -> Channel 순서)
-    output[patch_idx * EMBED_DIM + oc] = sum;
+    int dest_idx = b * dims_per_img + patch_idx * EMBED_DIM + oc;
+    output[dest_idx] = sum;
 }
+
 
 // 2. Class Token 붙이기 + Position Embedding 더하기
 // Global Size: (total_tokens * embed_dim) -> 197 * 768
 __kernel void prepare_input_kernel(__global const float* patch_tokens,
     __global float* final_tokens,
     __global const float* cls_token,
-    __global const float* pos_emb)
+    __global const float* pos_emb,
+    int tokens_per_img,   // 197
+    int batch_size)
 {
     int idx = get_global_id(0);
-    int num_patches = (IMG_SIZE / PATCH_SIZE) * (IMG_SIZE / PATCH_SIZE);
-    int total_tokens = num_patches + 1;
 
-    if (idx >= total_tokens * EMBED_DIM) return;
+    int total_tokens = tokens_per_img * batch_size;
+    int total_elems = total_tokens * EMBED_DIM;
 
-    int token_idx = idx / EMBED_DIM;
+    if (idx >= total_elems) return;
+
+    int token_idx_global = idx / EMBED_DIM;      // [0 .. total_tokens-1]
     int dim_idx = idx % EMBED_DIM;
+
+    int b = token_idx_global / tokens_per_img;
+    int token_idx = token_idx_global % tokens_per_img; // 0: CLS, 1~: patch
 
     float val = 0.0f;
 
     if (token_idx == 0) {
-        // Class Token
         val = cls_token[dim_idx];
     }
     else {
-        // Patch Tokens (앞에 1칸 밀림)
-        val = patch_tokens[(token_idx - 1) * EMBED_DIM + dim_idx];
+        int patch_idx = token_idx - 1;
+        int src_idx = b * ((tokens_per_img - 1) * EMBED_DIM)
+            + patch_idx * EMBED_DIM + dim_idx;
+        val = patch_tokens[src_idx];
     }
 
-    // Add Position Embedding
-    final_tokens[idx] = val + pos_emb[idx];
+    // pos_emb도 배치별 같은 걸 쓰고 싶다면, 보통 [tokens_per_img * EMBED_DIM] 크기로 두고
+    int pos_idx = token_idx * EMBED_DIM + dim_idx;
+    final_tokens[idx] = val + pos_emb[pos_idx];
 }
+
 
 // 3. Layer Normalization
 // Global Size: (tokens) -> 197
@@ -182,7 +175,7 @@ __kernel void layer_norm_kernel(__global const float* input,
 
         s_mean = total_sum / (float)EMBED_DIM;
         float var = total_sq / (float)EMBED_DIM - s_mean * s_mean;
-        s_invstd = native_recip(native_sqrt(var + EPS));
+        s_invstd = rsqrt(var + EPS);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -287,19 +280,26 @@ __kernel void gelu_kernel(__global float* data)
 // Q * K^T 연산을 위해 K 로딩 시 Transpose 수행
 __kernel void attn_score_kernel(__global const float* qkv,
     __global float* scores,
-    int total_tokens)
+    int total_tokens,   // per image (197)
+    int batch_size)
 {
-    // Global ID Mapping: (Col=j=KeyToken, Row=i=QueryToken, Batch=h=Head)
-    int j = get_global_id(0);
-    int i = get_global_id(1);
-    int h = get_global_id(2);
+    int j = get_global_id(0); // key token idx (0..T-1)
+    int i = get_global_id(1); // query token idx (0..T-1)
+    int bh = get_global_id(2); // 0..(B*NUM_HEADS-1)
 
     int local_j = get_local_id(0);
     int local_i = get_local_id(1);
 
+    int b = bh / NUM_HEADS;
+    int h = bh % NUM_HEADS;
+
+    if (b >= batch_size || h >= NUM_HEADS ||
+        i >= total_tokens || j >= total_tokens)
+        return;
+
     const int TSz = 16;
-    __local float As[16][17]; // Q Tile
-    __local float Bs[16][17]; // K Tile (Transposed)
+    __local float As[16][17]; // Q tile
+    __local float Bs[16][17]; // K tile (transposed)
 
     int stride = 3 * EMBED_DIM;
     int q_offset_base = h * HEAD_DIM;
@@ -311,30 +311,23 @@ __kernel void attn_score_kernel(__global const float* qkv,
     for (int t = 0; t < num_tiles; ++t) {
         int d_base = t * TSz;
 
-        // 1. Load Q Tile -> As[local_i][local_j]
-        // Q[i][d]를 로딩. (여기서 local_j는 dim 인덱스 역할)
-        if (i < total_tokens) {
-            // d_base + local_j 가 실제 dimension index
-            As[local_i][local_j] = qkv[i * stride + q_offset_base + (d_base + local_j)];
+        // token index in qkv: [B*T, ...]
+        int token_q = b * total_tokens + i;
+        int token_k = b * total_tokens + j;
+
+        // Q load
+        if (local_j < TSz) {
+            As[local_i][local_j] =
+                qkv[token_q * stride + q_offset_base + (d_base + local_j)];
         }
         else {
             As[local_i][local_j] = 0.0f;
         }
 
-        // 2. Load K Tile (Transpose) -> Bs[local_i][local_j]
-        // 우리는 나중에 Bs[k][local_j]로 접근하여 K[j][d] 값을 얻고 싶음. (K^T 효과)
-        // 로딩 시점: 
-        //   - Row Index (Global): j (Key Token)
-        //   - Col Index (Global): d_base + local_i (Dimension)
-        // 이것을 Bs[local_i][local_j]에 저장하면:
-        //   - Bs의 Row는 Dimension이 됨
-        //   - Bs의 Col은 Token이 됨
-        // 이렇게 해야 Compute 단계에서 Bs[k][local_j] (Row=Dim, Col=Token)가 성립됨.
-
-        if (j < total_tokens) {
-            // (주의) 저장 위치: [local_i][local_j] <--- Transpose!
-            // 읽는 위치: j(Token) * stride + ... + (d_base + local_i)(Dim)
-            Bs[local_i][local_j] = qkv[j * stride + k_offset_base + (d_base + local_i)];
+        // K load (transpose)
+        if (local_i < TSz) {
+            Bs[local_i][local_j] =
+                qkv[token_k * stride + k_offset_base + (d_base + local_i)];
         }
         else {
             Bs[local_i][local_j] = 0.0f;
@@ -342,10 +335,6 @@ __kernel void attn_score_kernel(__global const float* qkv,
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute
-        // As[local_i][k] : Q[i][dim_k]
-        // Bs[k][local_j] : Transposed K -> K[j][dim_k]
-        // 결과적으로 Q[i] dot K[j] 수행
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_i][k] * Bs[k][local_j];
@@ -354,10 +343,9 @@ __kernel void attn_score_kernel(__global const float* qkv,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    if (h < NUM_HEADS && i < total_tokens && j < total_tokens) {
-        int out_idx = (h * total_tokens + i) * total_tokens + j;
-        scores[out_idx] = sum / native_sqrt((float)HEAD_DIM);
-    }
+    // scores: [B, H, T, T]
+    int out_idx = (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j);
+    scores[out_idx] = sum / sqrt((float)HEAD_DIM);
 }
 
 // [Optimized Tiled Kernel 4] Attention Value (Scores * V)
@@ -366,49 +354,53 @@ __kernel void attn_score_kernel(__global const float* qkv,
 __kernel void attn_value_kernel(__global const float* scores,
     __global const float* qkv,
     __global float* attn_output,
-    int total_tokens)
+    int total_tokens,   // per img
+    int batch_size)
 {
-    // Global ID Mapping: (Col=d, Row=i, Batch=h)
-    int d = get_global_id(0); // Output Feature index (0~63)
-    int i = get_global_id(1); // Token index (0~196)
-    int h = get_global_id(2); // Head index
+    int d = get_global_id(0); // 0..63
+    int i = get_global_id(1); // token idx
+    int bh = get_global_id(2); // 0..(B*H-1)
 
     int local_d = get_local_id(0);
     int local_i = get_local_id(1);
 
+    int b = bh / NUM_HEADS;
+    int h = bh % NUM_HEADS;
+
+    if (b >= batch_size || h >= NUM_HEADS ||
+        i >= total_tokens || d >= HEAD_DIM)
+        return;
+
     const int TSz = 16;
-    __local float As[16][17]; // Score Tile
-    __local float Bs[16][17]; // V Tile
+    __local float As[16][17];
+    __local float Bs[16][17];
 
     int stride = 3 * EMBED_DIM;
     int v_offset_base = 2 * EMBED_DIM + h * HEAD_DIM;
 
     float sum = 0.0f;
-
-    // Inner Loop: j dimension (Tokens = 197)
     int num_tiles = (total_tokens + TSz - 1) / TSz;
 
     for (int t = 0; t < num_tiles; ++t) {
         int j_base = t * TSz;
 
-        // 1. Load Score Tile (Row: i, Col: j) -> As[local_i][local_d]
-        // 여기서는 local_d가 j 인덱스 역할을 함 (Loading 시점)
-        int current_j = j_base + local_d;
+        int j_for_score = j_base + local_d;
+        int j_for_v = j_base + local_i;
 
-        if (i < total_tokens && current_j < total_tokens) {
-            int score_idx = (h * total_tokens + i) * total_tokens + current_j;
+        // Score row index: (b,h,i)
+        if (j_for_score < total_tokens) {
+            int score_idx =
+                (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j_for_score);
             As[local_i][local_d] = scores[score_idx];
         }
         else {
             As[local_i][local_d] = 0.0f;
         }
 
-        // 2. Load V Tile (Row: j, Col: d) -> Bs[local_i][local_d]
-        // 여기서는 local_i가 j 인덱스 역할을 함
-        int current_j_for_v = j_base + local_i;
-
-        if (d < HEAD_DIM && current_j_for_v < total_tokens) {
-            int v_idx = current_j_for_v * stride + v_offset_base + d;
+        // V token index: (b,j)
+        if (j_for_v < total_tokens && d < HEAD_DIM) {
+            int token_v = b * total_tokens + j_for_v;
+            int v_idx = token_v * stride + v_offset_base + d;
             Bs[local_i][local_d] = qkv[v_idx];
         }
         else {
@@ -417,7 +409,6 @@ __kernel void attn_value_kernel(__global const float* scores,
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_i][k] * Bs[k][local_d];
@@ -426,10 +417,10 @@ __kernel void attn_value_kernel(__global const float* scores,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    if (h < NUM_HEADS && i < total_tokens && d < HEAD_DIM) {
-        int out_idx = i * EMBED_DIM + h * HEAD_DIM + d;
-        attn_output[out_idx] = sum;
-    }
+    // output: [B*T, EMBED_DIM]
+    int token_o = b * total_tokens + i;
+    int out_idx = token_o * EMBED_DIM + h * HEAD_DIM + d;
+    attn_output[out_idx] = sum;
 }
 
 
@@ -440,28 +431,21 @@ __kernel void attn_value_kernel(__global const float* scores,
 __kernel void softmax_kernel(__global float* scores, int total_tokens)
 {
     int tid = get_local_id(0);
-    int group_id = get_group_id(0); // This represents unique row index
-
-    // Original Logic: row_offset = (h * tokens + i) * tokens
-    // We flattened the global execution. 
-    // group_id corresponds to (h * tokens + i)
-
+    int group_id = get_group_id(0);
     int row_offset = group_id * total_tokens;
 
-    __local float s_data[256]; // Shared Mem
+    __local float s_data[256];
     __local float s_max;
     __local float s_sum;
 
-    // 1. Find Max (Parallel Reduction)
-    float my_val = -1e30f; // -Infinity
-
+    // 1. Find Max 
+    float my_val = -1e30f;
     if (tid < total_tokens) {
         my_val = scores[row_offset + tid];
     }
     s_data[tid] = my_val;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Tree Reduction for Max
     for (int s = 128; s > 0; s >>= 1) {
         if (tid < s) {
             if (s_data[tid + s] > s_data[tid]) {
@@ -473,27 +457,18 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     if (tid == 0) s_max = s_data[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // 2. Calculate Exp & Sum (Parallel Reduction)
+    // 2. Calculate Exp & Sum (native_exp -> exp)
     float my_exp = 0.0f;
     if (tid < total_tokens) {
-        // Recalculate my_val or read from global? 
-        // Global read is safer as s_data was modified.
-        // Or simply: my_val is still in register if not spilled.
-        // Let's read strictly to be safe, or reuse logic.
-        // Actually we need to update global memory with exp values? 
-        // No, standard softmax writes normalized values at the end.
-        // Let's compute exp and store in local temporarily? 
-        // No, writing to global intermediate is fine.
-
         float val = scores[row_offset + tid];
-        my_exp = native_exp(val - s_max);
-        scores[row_offset + tid] = my_exp; // Write exp temporarily
+        // [Fix] native_exp는 오차가 큽니다. exp 사용.
+        my_exp = exp(val - s_max);
+        scores[row_offset + tid] = my_exp;
     }
 
     s_data[tid] = my_exp;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // Tree Reduction for Sum
     for (int s = 128; s > 0; s >>= 1) {
         if (tid < s) {
             s_data[tid] += s_data[tid + s];
@@ -503,14 +478,12 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     if (tid == 0) s_sum = s_data[0];
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    // 3. Normalize
+    // 3. Normalize (native_recip -> 나눗셈 연산)
     if (tid < total_tokens) {
-        float inv_sum = native_recip(s_sum);
-        // Read the exp value we wrote earlier
-        scores[row_offset + tid] *= inv_sum;
+        // [Fix] 정밀도를 위해 직접 나눗셈
+        scores[row_offset + tid] /= s_sum;
     }
 }
-
 
 // [Optimized Tiled Kernel 1] Linear + GELU
 // 1. Tiling (Local Memory) 복구
@@ -579,14 +552,14 @@ __kernel void linear_gelu_kernel(__global const float* input,
 }
 
 // [Optimized Tiled Kernel 2] Linear + Add
-__kernel void linear_add_kernel(__global const float* input,
-    __global float* output,
-    __global const float* weight,
-    __constant const float* bias,
+__kernel void linear_add_kernel(__global const float* restrict input,
+    __global float* restrict output,
+    __global const float* restrict weight,
+    __constant const float* restrict bias,
     int in_features,
     int out_features,
     int tokens,
-    __global const float* prev_state) // Skip Connection
+    __global const float* restrict prev_state) // Skip Connection
 {
     int row = get_global_id(0);
     int col = get_global_id(1);
@@ -594,8 +567,6 @@ __kernel void linear_add_kernel(__global const float* input,
     int local_col = get_local_id(1);
 
     const int TSz = 16;
-
-    // ★ Padding [16][17]
     __local float As[16][17];
     __local float Bs[16][17];
 
@@ -620,7 +591,6 @@ __kernel void linear_add_kernel(__global const float* input,
 
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // Compute
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_row][k] * Bs[k][local_col];
@@ -629,10 +599,28 @@ __kernel void linear_add_kernel(__global const float* input,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // Result + Add
     if (row < tokens && col < out_features) {
         float val = sum + bias[col];
-        // Add Residual
+        // [Note] restrict를 썼으므로 컴파일러가 output과 prev_state를 
+        // 겹치지 않는 것으로 가정하고 안전하게 로드/스토어 순서를 잡거나, 
+        // 하드웨어가 읽기-수정-쓰기를 정확히 처리합니다.
         output[row * out_features + col] = val + prev_state[row * out_features + col];
     }
+}
+
+__kernel void gather_cls_kernel(__global const float* tokens,
+    __global float* cls_out,
+    int tokens_per_img,
+    int batch_size)
+{
+    int b = get_global_id(0); // 0..B-1
+    int d = get_global_id(1); // 0..dim-1
+
+    if (b >= batch_size || d >= EMBED_DIM) return;
+
+    int cls_token_idx = b * tokens_per_img; // 각 이미지의 0번 토큰이 CLS
+    int src_idx = cls_token_idx * EMBED_DIM + d;
+    int dst_idx = b * EMBED_DIM + d;
+
+    cls_out[dst_idx] = tokens[src_idx];
 }
