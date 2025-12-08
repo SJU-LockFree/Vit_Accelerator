@@ -84,10 +84,10 @@
 | **Step 6** | unwrap 적용 | 9.66s | -0.37s |  |
 | **Step 7** | 커널 함수 인자 일부에 `__global` 대신 `__constant` 적용 | 9.55s | -0.11s |  |
 | **Step 8** | 컴파일러 옵션에 Fast Math 적용 | 8.75s | -0.8s |  |
-| **Step 9** | Tiling + Padding (Bank Conflict Free) | (re-Conv2d_MLP 실행 시간) | | 메모리 효율 증대, 입력 16비트 전환 제거 |
-| **Step 10** | Kernel Fusion + Attention Optimized | (re-MHA 실행 시간) |  | 오버헤드 감소 |
-| **Step 11** | Transposed Loading (Score Kernel) | (re-LN_Softmax 실행 시간) |  | 정확도 확보 및 가속 |
-| **Step 12** | Parallel Reduction + Fast Math | (re-Native 실행 시간) |  |  |
+| **Step 9** | Tiling + Padding (Bank Conflict Free) | 7.27s | | 메모리 효율 증대, 입력 16비트 전환 제거 |
+| **Step 10** | Kernel Fusion + Attention Optimized | 5.01s |  | 오버헤드 감소 |
+| **Step 11** | Transposed Loading (Score Kernel) | 4.91s |  | 정확도 확보 및 가속 |
+| **Step 12** | Parallel Reduction + Fast Math | 4.81s |  |  |
 
 > **Result:** 초기 대비 약 **n배**, **-n초**의 성능 향상을 달성하였으며, 결과값 검증(Comparator)을 통과하여 정확성을 입증했습니다.
 
@@ -107,4 +107,4 @@
 
 예시 : 
 
-본 프로젝트를 통해 단순히 알고리즘을 GPU로 옮기는 것만으로는 성능 향상에 한계가 있음을 깨달았습니다. GPU 아키텍처의 **Memory Hierarchy(Global vs Local)**와 **Parallelism(Thread vs Work-Group)**을 깊이 이해하고, **Bank Conflict**나 **Memory Coalescing** 같은 하드웨어 병목을 해결했을 때 비로소 유의미한 가속을 이룰 수 있었습니다. 특히 디버깅이 어려운 병렬 프로그래밍 환경에서 정확도를 유지하며 최적화하는 경험을 통해 GPGPU 프로그래밍에 대한 깊은 이해를 얻었습니다.
+본 프로젝트를 통해 단순히 알고리즘을 GPU로 옮기는 것만으로는 성능 향상에 한계가 있음을 깨달았습니다. GPU 아키텍처의 **Memory Hierarchy(Global vs Local)**와 **Parallelism(Thread vs Work-Group)**을 깊이 이해하고, **Bank Conflict**나 **Memory Coalescing** 같은 하드웨어 병목을 해결했을 때 비로소 유의미한 가속을 이룰 수 있었습니다. 특히 디버깅이 어려운 병렬 프로그래밍 환경에서 정확도를 유지하며 최적화하는 경험을 통해 GPU 프로그래밍에 대한 깊은 이해를 얻었습니다.
