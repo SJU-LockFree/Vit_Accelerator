@@ -30,8 +30,10 @@ __kernel void conv2d_kernel(__global const float* input,
     int b = idx / dims_per_img;      // 배치 인덱스
     int idx_in_img = idx % dims_per_img;
 
-    int oc = idx_in_img / patches_per_img;
-    int patch_idx = idx_in_img % patches_per_img;
+    /*int oc = idx_in_img / patches_per_img;
+    int patch_idx = idx_in_img % patches_per_img;*/
+    int patch_idx = idx_in_img / EMBED_DIM;
+    int oc = idx_in_img % EMBED_DIM;
 
     int oh = patch_idx / out_hw;
     int ow = patch_idx % out_hw;
@@ -280,12 +282,13 @@ __kernel void gelu_kernel(__global float* data)
 // Q * K^T 연산을 위해 K 로딩 시 Transpose 수행
 __kernel void attn_score_kernel(__global const float* qkv,
     __global float* scores,
-    int total_tokens,   // per image (197)
+    int total_tokens,   // 197
     int batch_size)
 {
-    int j = get_global_id(0); // key token idx (0..T-1)
-    int i = get_global_id(1); // query token idx (0..T-1)
-    int bh = get_global_id(2); // 0..(B*NUM_HEADS-1)
+    // 1. 인덱스 계산
+    int j = get_global_id(0); // key token idx (0..T-1) -> padded
+    int i = get_global_id(1); // query token idx (0..T-1) -> padded
+    int bh = get_global_id(2);
 
     int local_j = get_local_id(0);
     int local_i = get_local_id(1);
@@ -293,48 +296,55 @@ __kernel void attn_score_kernel(__global const float* qkv,
     int b = bh / NUM_HEADS;
     int h = bh % NUM_HEADS;
 
-    if (b >= batch_size || h >= NUM_HEADS ||
-        i >= total_tokens || j >= total_tokens)
-        return;
+    // [수정 1] 여기서 return 해버리면 Barrier가 깨집니다! 삭제하세요.
+    // if (b >= batch_size || h >= NUM_HEADS || ... return; ) -> 삭제
+
+    // 유효성 플래그 미리 계산
+    bool valid_i = (i < total_tokens) && (b < batch_size);
+    bool valid_j = (j < total_tokens) && (b < batch_size);
 
     const int TSz = 16;
-    __local float As[16][17]; // Q tile
-    __local float Bs[16][17]; // K tile (transposed)
+    __local float As[16][17]; // Bank Conflict 방지 패딩
+    __local float Bs[16][17];
 
     int stride = 3 * EMBED_DIM;
     int q_offset_base = h * HEAD_DIM;
     int k_offset_base = EMBED_DIM + h * HEAD_DIM;
 
     float sum = 0.0f;
-    int num_tiles = HEAD_DIM / TSz; // 64 / 16 = 4
+    int num_tiles = HEAD_DIM / TSz;
 
     for (int t = 0; t < num_tiles; ++t) {
         int d_base = t * TSz;
 
-        // token index in qkv: [B*T, ...]
-        int token_q = b * total_tokens + i;
-        int token_k = b * total_tokens + j;
+        // [수정 2] 로딩할 때 유효 범위 체크 (범위 밖이면 0.0으로 채움)
 
-        // Q load
-        if (local_j < TSz) {
-            As[local_i][local_j] =
-                qkv[token_q * stride + q_offset_base + (d_base + local_j)];
+        // Q Load: Row 'i'가 유효해야 함
+        // As[local_i][local_j] -> Row: i, Col: d (local_j가 dim 역할)
+        if (valid_i) {
+            // Query는 Token Index 'i'를 따라감
+            int token_q = b * total_tokens + i;
+            As[local_i][local_j] = qkv[token_q * stride + q_offset_base + (d_base + local_j)];
         }
         else {
             As[local_i][local_j] = 0.0f;
         }
 
-        // K load (transpose)
-        if (local_i < TSz) {
-            Bs[local_i][local_j] =
-                qkv[token_k * stride + k_offset_base + (d_base + local_i)];
+        // K Load (Transposed): Row 'j'가 유효해야 함
+        // Bs[local_i][local_j] -> Row: d (local_i가 dim 역할), Col: j
+        if (valid_j) {
+            // Key는 Token Index 'j'를 따라감
+            int token_k = b * total_tokens + j;
+            Bs[local_i][local_j] = qkv[token_k * stride + k_offset_base + (d_base + local_i)];
         }
         else {
             Bs[local_i][local_j] = 0.0f;
         }
 
+        // 모든 스레드가 로딩을 마칠 때까지 대기
         barrier(CLK_LOCAL_MEM_FENCE);
 
+        // 연산 (범위 밖 스레드도 계산은 참여하되, 나중에 버림)
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_i][k] * Bs[k][local_j];
@@ -343,23 +353,25 @@ __kernel void attn_score_kernel(__global const float* qkv,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // scores: [B, H, T, T]
-    int out_idx = (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j);
-    scores[out_idx] = sum / sqrt((float)HEAD_DIM);
+    // [수정 3] 저장할 때만 유효성 체크해서 쓰기
+    if (valid_i && valid_j) {
+        int out_idx = (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j);
+        scores[out_idx] = sum / sqrt((float)HEAD_DIM);
+    }
 }
-
 // [Optimized Tiled Kernel 4] Attention Value (Scores * V)
 // Global Size: (head_dim, total_tokens, num_heads) -> (64, 197, 12)
 // d(Feature), i(Query Token), h(Head) 순서
 __kernel void attn_value_kernel(__global const float* scores,
     __global const float* qkv,
     __global float* attn_output,
-    int total_tokens,   // per img
+    int total_tokens,   // per img (197)
     int batch_size)
 {
-    int d = get_global_id(0); // 0..63
-    int i = get_global_id(1); // token idx
-    int bh = get_global_id(2); // 0..(B*H-1)
+    // 1. 인덱스 확보
+    int d = get_global_id(0); // Head Dim (0..63) -> padded to 64 or 80
+    int i = get_global_id(1); // Token idx (0..196) -> padded to 208
+    int bh = get_global_id(2);
 
     int local_d = get_local_id(0);
     int local_i = get_local_id(1);
@@ -367,39 +379,47 @@ __kernel void attn_value_kernel(__global const float* scores,
     int b = bh / NUM_HEADS;
     int h = bh % NUM_HEADS;
 
-    if (b >= batch_size || h >= NUM_HEADS ||
-        i >= total_tokens || d >= HEAD_DIM)
-        return;
+    // [수정 1] Return 삭제! (여기서 나가면 Barrier에서 멈춤)
+    // if (b >= batch_size ... return;) -> 삭제
+
+    // 2. 내 스레드가 유효한지 확인하는 플래그 생성
+    bool valid_batch = (b < batch_size && h < NUM_HEADS);
+    bool valid_i = (i < total_tokens) && valid_batch;     // 행(Query/Output) 유효성
+    bool valid_d = (d < HEAD_DIM) && valid_batch;         // 열(HeadDim) 유효성
 
     const int TSz = 16;
-    __local float As[16][17];
+    __local float As[16][17]; // Bank Conflict 방지
     __local float Bs[16][17];
 
     int stride = 3 * EMBED_DIM;
     int v_offset_base = 2 * EMBED_DIM + h * HEAD_DIM;
 
     float sum = 0.0f;
+    // total_tokens가 197이면 16으로 나누어 떨어지지 않으므로 올림 나눗셈 필요
     int num_tiles = (total_tokens + TSz - 1) / TSz;
 
     for (int t = 0; t < num_tiles; ++t) {
         int j_base = t * TSz;
 
-        int j_for_score = j_base + local_d;
-        int j_for_v = j_base + local_i;
+        // 타일 내부 좌표에 해당하는 실제 j(Key/Value Token Index) 계산
+        int col_j_for_A = j_base + local_d; // As 로딩용 j (Column)
+        int row_j_for_B = j_base + local_i; // Bs 로딩용 j (Row)
 
-        // Score row index: (b,h,i)
-        if (j_for_score < total_tokens) {
-            int score_idx =
-                (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j_for_score);
+        // [수정 2] As (Scores) 로딩: A[i][j]
+        // 조건: 내 행(i)이 유효하고 & 로딩하려는 열(j)이 유효해야 함
+        if (valid_i && (col_j_for_A < total_tokens)) {
+            // score_idx = (b, h, i, j)
+            int score_idx = (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + col_j_for_A);
             As[local_i][local_d] = scores[score_idx];
         }
         else {
-            As[local_i][local_d] = 0.0f;
+            As[local_i][local_d] = 0.0f; // 패딩 영역 0으로 채움
         }
 
-        // V token index: (b,j)
-        if (j_for_v < total_tokens && d < HEAD_DIM) {
-            int token_v = b * total_tokens + j_for_v;
+        // [수정 3] Bs (Values) 로딩: B[j][d]
+        // 조건: 로딩하려는 행(j)이 유효하고 & 내 열(d)이 유효해야 함
+        if ((row_j_for_B < total_tokens) && valid_d) {
+            int token_v = b * total_tokens + row_j_for_B;
             int v_idx = token_v * stride + v_offset_base + d;
             Bs[local_i][local_d] = qkv[v_idx];
         }
@@ -407,8 +427,10 @@ __kernel void attn_value_kernel(__global const float* scores,
             Bs[local_i][local_d] = 0.0f;
         }
 
+        // Barrier: 모든 스레드가 로딩을 마칠 때까지 대기
         barrier(CLK_LOCAL_MEM_FENCE);
 
+        // 연산 (패딩 스레드도 계산에는 참여하지만 0을 더하므로 영향 없음)
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_i][k] * Bs[k][local_d];
@@ -417,10 +439,12 @@ __kernel void attn_value_kernel(__global const float* scores,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // output: [B*T, EMBED_DIM]
-    int token_o = b * total_tokens + i;
-    int out_idx = token_o * EMBED_DIM + h * HEAD_DIM + d;
-    attn_output[out_idx] = sum;
+    // [수정 4] 최종 저장: 진짜 유효한 스레드만 저장
+    if (valid_i && valid_d) {
+        int token_o = b * total_tokens + i;
+        int out_idx = token_o * EMBED_DIM + h * HEAD_DIM + d;
+        attn_output[out_idx] = sum;
+    }
 }
 
 
