@@ -14,7 +14,7 @@
 <br>
 
 ## 💻 개발 환경 (Environment)
-* **CPU:** ( 확인중 )
+* **CPU:** Intel(R) Core(TM) i7-14700KF(3.40 GHz)
 * **GPU:** NVIDIA GeForce GTX 4060
 * **OS:** Windows 11
 * **Framework:** OpenCL 
@@ -81,12 +81,12 @@
 | **Step 6** | unwrap 적용 | 9.66s | -0.37s |  |
 | **Step 7** | 커널 함수 인자 일부에 `__global` 대신 `__constant` 적용 | 9.55s | -0.11s |  |
 | **Step 8** | 컴파일러 옵션에 Fast Math 적용 | 8.75s | -0.8s |  |
-| **Step 9** | Tiling + Padding (Bank Conflict Free) | 7.27s | | 메모리 효율 증대, 입력 16비트 전환 제거 |
-| **Step 10** | Kernel Fusion + Attention Optimized | 5.01s |  | 오버헤드 감소 |
-| **Step 11** | Transposed Loading (Score Kernel) | 4.91s |  | 정확도 확보 및 가속 |
-| **Step 12** | Parallel Reduction + Fast Math | 4.81s |  |  |
+| **Step 9** | Tiling + Padding (Bank Conflict Free) | 7.27s | -1.48 | 메모리 효율 증대, 입력 16비트 전환 제거 |
+| **Step 10** | Kernel Fusion + Attention Optimized | 5.01s | -2.26 | 오버헤드 감소 |
+| **Step 11** | Transposed Loading (Score Kernel) | 4.91s | -0.1 | 정확도 확보 및 가속 |
+| **Step 12** | Parallel Reduction + Fast Math | 4.81s | -0.1 |  |
 
-> **Result:** 초기 대비 약 **n배**, **-n초**의 성능 향상을 달성하였으며, 결과값 검증(Comparator)을 통과하여 정확성을 입증했습니다.
+> **Result:** 초기 대비 약 **0.0016배**, **-3091.19초**의 성능 향상을 달성하였으며, 결과값 검증(Comparator)을 통과하여 정확성을 입증했습니다.
 
 <br>
 
@@ -98,10 +98,28 @@
 
 <br>
 
-## 📃 결론 및 고찰 (Conclusion)
+## 📃 고찰 및 느낀 점 (Conclusion)
 
-작성 중 : 
+- 구동준 :
 
-예시 : 
+ 본 프로젝트를 진행하면서 GPU 아키텍처의 메모리 계층 구조와 병렬 처리 모델에 대한 깊은 이해가 필요하다는 것을 깨달았습니다. 
 
-본 프로젝트를 통해 단순히 알고리즘을 GPU로 옮기는 것만으로는 성능 향상에 한계가 있음을 깨달았습니다. GPU 아키텍처의 **Memory Hierarchy(Global vs Local)**와 **Parallelism(Thread vs Work-Group)**을 깊이 이해하고, **Bank Conflict**나 **Memory Coalescing** 같은 하드웨어 병목을 해결했을 때 비로소 유의미한 가속을 이룰 수 있었습니다. 특히 디버깅이 어려운 병렬 프로그래밍 환경에서 정확도를 유지하며 최적화하는 경험을 통해 GPU 프로그래밍에 대한 깊은 이해를 얻었습니다.
+ <br>
+
+ 코드를 병렬화하는 과정에서 다양한 문제들을 겪었습니다.
+속도가 오히려 느려지는 경험도 많이 하였고, 빨라졌지만 결과값이 틀려지는 경험도 많이 하였습니다. 
+커널 함수들을 전체적으로 수정할 때, 벡터화를 적용할 때 특히 많은 시행착오를 겪었으며, 문제가 생길 때마다 `git restore .`를 실행하며 이전 상태로 되돌리곤 했습니다.
+이러한 수없이 많은 시행착오를 겪으며 문제 해결 능력이 향상되었고, 디버깅 스킬도 크게 발전했다고 생각합니다.
+
+<br>
+ 
+ 마지막까지 해결되지 않은 문제도 있었습니다. 
+호스트 코드의 배치화를 도전했습니다. 결과값이 틀리는 문제도 발생했고, 속도가 오히려 느려지는 문제도 발생했습니다.
+최대한 시간을 투자해봤지만 이는 결국 해결하지 못했습니다.
+ 
+ <br>
+
+ 이는 모두 소중한 경험이었고, 앞으로도 이러한 문제들을 해결해 나가며 성장해 나가야겠다는 다짐을 하게 되었습니다.
+
+
+- 여승연 : 
