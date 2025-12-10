@@ -273,21 +273,15 @@ __kernel void gelu_kernel(__global float* data)
 }
 
 // 7. Attention Score Calculation (Q * K^T)
-// Global Size: (heads, tokens, tokens)
-// Heads: 12, Tokens: 197
-// [Optimized Tiled Kernel 3] Attention Score (Q * K^T)
-// Global Size: (total_tokens, total_tokens, num_heads) -> (197, 197, 12)
-// j(Key Token), i(Query Token), h(Head) 순서
-// [FIXED] Attention Score Kernel
-// Q * K^T 연산을 위해 K 로딩 시 Transpose 수행
+// [Final Optimized] Attention Score Calculation
 __kernel void attn_score_kernel(__global const float* qkv,
     __global float* scores,
-    int total_tokens,   // 197
+    int total_tokens,
     int batch_size)
 {
     // 1. 인덱스 계산
-    int j = get_global_id(0); // key token idx (0..T-1) -> padded
-    int i = get_global_id(1); // query token idx (0..T-1) -> padded
+    int j = get_global_id(0); // key token idx
+    int i = get_global_id(1); // query token idx
     int bh = get_global_id(2);
 
     int local_j = get_local_id(0);
@@ -296,20 +290,30 @@ __kernel void attn_score_kernel(__global const float* qkv,
     int b = bh / NUM_HEADS;
     int h = bh % NUM_HEADS;
 
-    // [수정 1] 여기서 return 해버리면 Barrier가 깨집니다! 삭제하세요.
-    // if (b >= batch_size || h >= NUM_HEADS || ... return; ) -> 삭제
-
-    // 유효성 플래그 미리 계산
+    // 유효성 미리 계산
     bool valid_i = (i < total_tokens) && (b < batch_size);
     bool valid_j = (j < total_tokens) && (b < batch_size);
 
     const int TSz = 16;
-    __local float As[16][17]; // Bank Conflict 방지 패딩
+    __local float As[16][17];
     __local float Bs[16][17];
 
     int stride = 3 * EMBED_DIM;
     int q_offset_base = h * HEAD_DIM;
     int k_offset_base = EMBED_DIM + h * HEAD_DIM;
+
+    // [최적화 2] 루프 밖으로 인덱스 계산 이동 (Base Index Pre-calculation)
+    // Q는 i(Row)에 의존하므로 미리 계산 가능
+    int q_base_idx = -1;
+    if (valid_i) {
+        q_base_idx = (b * total_tokens + i) * stride + q_offset_base;
+    }
+
+    // K는 j(Col -> Row in Bs)에 의존하므로 미리 계산 가능
+    int k_base_idx = -1;
+    if (valid_j) {
+        k_base_idx = (b * total_tokens + j) * stride + k_offset_base;
+    }
 
     float sum = 0.0f;
     int num_tiles = HEAD_DIM / TSz;
@@ -317,34 +321,27 @@ __kernel void attn_score_kernel(__global const float* qkv,
     for (int t = 0; t < num_tiles; ++t) {
         int d_base = t * TSz;
 
-        // [수정 2] 로딩할 때 유효 범위 체크 (범위 밖이면 0.0으로 채움)
-
-        // Q Load: Row 'i'가 유효해야 함
-        // As[local_i][local_j] -> Row: i, Col: d (local_j가 dim 역할)
+        // [최적화 3] 조건문 단순화 및 중복 계산 제거
+        // Q Load
         if (valid_i) {
-            // Query는 Token Index 'i'를 따라감
-            int token_q = b * total_tokens + i;
-            As[local_i][local_j] = qkv[token_q * stride + q_offset_base + (d_base + local_j)];
+            // q_base_idx + (d_base + local_j)
+            As[local_i][local_j] = qkv[q_base_idx + d_base + local_j];
         }
         else {
             As[local_i][local_j] = 0.0f;
         }
 
-        // K Load (Transposed): Row 'j'가 유효해야 함
-        // Bs[local_i][local_j] -> Row: d (local_i가 dim 역할), Col: j
+        // K Load (Transposed)
         if (valid_j) {
-            // Key는 Token Index 'j'를 따라감
-            int token_k = b * total_tokens + j;
-            Bs[local_i][local_j] = qkv[token_k * stride + k_offset_base + (d_base + local_i)];
+            // k_base_idx + (d_base + local_i)
+            Bs[local_i][local_j] = qkv[k_base_idx + d_base + local_i];
         }
         else {
             Bs[local_i][local_j] = 0.0f;
         }
 
-        // 모든 스레드가 로딩을 마칠 때까지 대기
         barrier(CLK_LOCAL_MEM_FENCE);
 
-        // 연산 (범위 밖 스레드도 계산은 참여하되, 나중에 버림)
 #pragma unroll
         for (int k = 0; k < TSz; ++k) {
             sum += As[local_i][k] * Bs[k][local_j];
@@ -353,12 +350,12 @@ __kernel void attn_score_kernel(__global const float* qkv,
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    // [수정 3] 저장할 때만 유효성 체크해서 쓰기
     if (valid_i && valid_j) {
         int out_idx = (((b * NUM_HEADS + h) * total_tokens + i) * total_tokens + j);
-        scores[out_idx] = sum / sqrt((float)HEAD_DIM);
+        scores[out_idx] = sum / native_sqrt((float)HEAD_DIM);
     }
 }
+
 // [Optimized Tiled Kernel 4] Attention Value (Scores * V)
 // Global Size: (head_dim, total_tokens, num_heads) -> (64, 197, 12)
 // d(Feature), i(Query Token), h(Head) 순서
@@ -486,7 +483,7 @@ __kernel void softmax_kernel(__global float* scores, int total_tokens)
     if (tid < total_tokens) {
         float val = scores[row_offset + tid];
         // [Fix] native_exp는 오차가 큽니다. exp 사용.
-        my_exp = exp(val - s_max);
+        my_exp = native_exp(val - s_max);
         scores[row_offset + tid] = my_exp;
     }
 

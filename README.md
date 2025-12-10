@@ -1,8 +1,5 @@
-<<<<<<< HEAD
-﻿# Vision Transformer (ViT) OpenCL Acceleration Project
-=======
+
 # Vision Transformer (ViT) OpenCL Acceleration Project
->>>>>>> eb75aff183733bafeee07038fce6ee30c4025110
 
 <br>
 
